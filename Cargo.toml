@@ -5,12 +5,15 @@ edition = "2024"
 description = "Rust reimplementation of SoRA_X7's Hikari Tetris AI"
 
 [features]
+default = ["fast-registration"]
 # Experimental low-stack movement shortcut; baseline behavior remains the default.
 fast-low-stack = []
 # Additional approximate pruning, matching the intent of Cold Clear's fast mode.
 prune-low-stack = ["fast-low-stack"]
 # Optional phase and CPU-time instrumentation, compiled out of normal builds.
 profile-search = []
+# Exact-key graph registration; disable default features for the reference path.
+fast-registration = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

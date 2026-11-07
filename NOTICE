@@ -1,7 +1,0 @@
-Original Hikari: SoRA_X7 (@X7_SoRA)
-Source: https://gitlab.com/SoRA_X7/hikari
-Reference revision: 90aef085a53d6048cbd19de7f4c9c53a6f3c8960
-
-Board, movement, evaluation, and graph-search algorithms in this Rust
-reimplementation are translated from that Hikari revision. The source
-correspondence and deliberate differences are recorded in docs/PORT.md.

@@ -18,6 +18,8 @@ struct Args {
     threads: usize,
     #[arg(long, default_value_t = 41001)]
     seed: u64,
+    #[arg(long, default_value_t = 32_000_000)]
+    max_nodes: usize,
     #[arg(long)]
     position: Option<PathBuf>,
 }
@@ -36,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         threads: args.threads,
         seed: args.seed,
-        max_nodes: 32_000_000,
+        max_nodes: args.max_nodes,
         ..Config::default()
     };
     let (board, queue) = if let Some(path) = &args.position {
@@ -75,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "instrumented": cfg!(feature = "profile-search"),
             "fast_low_stack": cfg!(feature = "fast-low-stack"),
             "prune_low_stack": cfg!(feature = "prune-low-stack"),
+            "fast_registration": cfg!(feature = "fast-registration"),
             "config":config,"elapsed_seconds":elapsed,"process_cpu_ns":process_cpu_ns,
             "stats":search.stats(),"best_move":search.best_move(),"plan":search.current_plan(),
             "profile":profile

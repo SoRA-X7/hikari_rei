@@ -70,7 +70,7 @@ def add_actual_boards(corpus_path, replay_path):
         ply, board = candidates[index]
         height = max((i + 1 for i, row in enumerate(board["rows"]) if row), default=0)
         corpus["entries"].append({
-            "id": f"actual-selfplay-{ply}", "source": "current-rust-selfplay-300",
+            "id": f"actual-selfplay-{ply}", "source": "selfplay-replay",
             "height": height, "stratum": stratum(height), "board": board,
         })
     corpus["actual_play_source"] = {"path": str(replay_path.resolve()),
@@ -98,7 +98,7 @@ def add_ultra_boards(corpus_path, replay_path):
         rows = candidates[index]
         height = max((i + 1 for i, row in enumerate(rows) if row), default=0)
         corpus["entries"].append({
-            "id": f"actual-ultra-{index}", "source": "current-rust-realtime-ultra",
+            "id": f"actual-ultra-{index}", "source": "ultra-replay",
             "height": height, "stratum": stratum(height),
             "board": {"rows": rows, "back_to_back": False, "hold": None, "bag": 0, "ren": 0},
         })
@@ -218,9 +218,9 @@ def main():
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--actual-replay", type=Path,
-                        default=Path("runs/validation/hikari-rust-port-v1/selfplay-300.json"))
+                        help="Optional selfplay replay to sample additional boards from")
     parser.add_argument("--ultra-replay", type=Path,
-                        default=Path("runs/ultra/hikari-rust-realtime-v1/replay.json"))
+                        help="Optional Ultra replay to sample additional boards from")
     parser.add_argument("--search-ms", type=int, default=3000)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--micro-trials", type=int, default=5)
@@ -251,8 +251,10 @@ def main():
     save(output / "manifest.json", manifest)
     corpus_path = output / "corpus.json"
     run([probes["baseline"], "corpus", "--output", corpus_path], commands)
-    add_actual_boards(corpus_path, args.actual_replay)
-    add_ultra_boards(corpus_path, args.ultra_replay)
+    if args.actual_replay:
+        add_actual_boards(corpus_path, args.actual_replay)
+    if args.ultra_replay:
+        add_ultra_boards(corpus_path, args.ultra_replay)
     corpus = load(corpus_path)
     manifest["corpus"] = {"path": str(corpus_path), "sha256": sha256(corpus_path),
                           "boards": len(corpus["entries"]),

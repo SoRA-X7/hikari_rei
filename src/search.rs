@@ -5,7 +5,9 @@
 //! children are ranked by their backed-up integer evaluation, selection is a
 //! weighted random walk, and a transposition has every incoming parent.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(feature = "fast-registration"))]
+use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -13,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::board::{Board, LockResult, Piece, PieceKind};
 use crate::eval::{Reward, Value, Weights, evaluate_board, evaluate_move};
+#[cfg(feature = "fast-registration")]
+use crate::graph_storage::{BoardLookup, board_hash};
 use crate::movegen;
 
 const NONE: u32 = u32::MAX;
@@ -229,7 +233,10 @@ struct ParentLink {
 struct Layer {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    #[cfg(not(feature = "fast-registration"))]
     lookup: HashMap<Board, u32>,
+    #[cfg(feature = "fast-registration")]
+    lookup: BoardLookup,
     parents: Vec<ParentLink>,
 }
 
@@ -243,6 +250,7 @@ impl Layer {
 
     /// Empty-hold children bypass deduplication, just like GraphGroup.AddNode:
     /// their next selection must have holding disabled.
+    #[cfg(not(feature = "fast-registration"))]
     fn add_node(&mut self, key: Board, parent: u32, bypass: bool) -> (u32, bool) {
         let existing = if bypass {
             None
@@ -263,6 +271,28 @@ impl Layer {
         self.parents.push(ParentLink { parent, next });
         (index, fresh)
     }
+
+    #[cfg(all(feature = "fast-registration", test))]
+    fn add_node(&mut self, key: Board, parent: u32, bypass: bool) -> (u32, bool) {
+        self.add_node_hashed(key, board_hash(&key), parent, bypass)
+    }
+
+    #[cfg(feature = "fast-registration")]
+    fn add_node_hashed(&mut self, key: Board, hash: u64, parent: u32, bypass: bool) -> (u32, bool) {
+        let next_index = self.nodes.len() as u32;
+        let (index, fresh) = if bypass {
+            (next_index, true)
+        } else {
+            self.lookup.insert_if_absent_hashed(key, hash, next_index)
+        };
+        if fresh {
+            self.nodes.push(Node::new(Value::default()));
+        }
+        let next = self.nodes[index as usize].parent_head;
+        self.nodes[index as usize].parent_head = self.parents.len() as u32;
+        self.parents.push(ParentLink { parent, next });
+        (index, fresh)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -278,6 +308,9 @@ struct PlannedEdge {
     // Intentionally before bag.Take(current): original ExpandJob keys and
     // evaluates this board. Selection reconstructs the consumed bag separately.
     board: Board,
+    /// Computed by the expansion worker once, then reused by registration.
+    #[cfg(feature = "fast-registration")]
+    hash: u64,
     piece: Option<Piece>,
     reward: Reward,
     time: i32,
@@ -614,6 +647,8 @@ impl Search {
             .map(|layer| layer.nodes.len())
             .sum::<usize>();
         let mut expanded = 0;
+        #[cfg(feature = "fast-registration")]
+        let mut capacity_keys = BoardLookup::default();
 
         for expansion in expansions {
             let selected = expansion.selected;
@@ -626,42 +661,107 @@ impl Search {
 
             // Reserve a complete expansion. A cap never silently truncates a
             // move set, marks a viable position dead, or clears a subtree.
-            let mut fresh_keys = HashSet::new();
-            let child_layer = &self.layers[selected.depth + 1];
-            let needed = expansion
-                .edges
-                .iter()
-                .filter(|edge| {
-                    edge.piece.is_none()
-                        || (!child_layer.lookup.contains_key(&edge.board)
-                            && fresh_keys.insert(edge.board))
-                })
-                .count();
-            if node_count + needed > self.config.max_nodes {
+            #[cfg(not(feature = "fast-registration"))]
+            let fits = {
+                let mut fresh_keys = HashSet::new();
+                let child_layer = &self.layers[selected.depth + 1];
+                let needed = expansion
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.piece.is_none()
+                            || (!child_layer.lookup.contains_key(&edge.board)
+                                && fresh_keys.insert(edge.board))
+                    })
+                    .count();
+                node_count + needed <= self.config.max_nodes
+            };
+            #[cfg(feature = "fast-registration")]
+            let fits = if expansion.edges.len() <= self.config.max_nodes - node_count {
+                // Every candidate adds at most one node. In the common case
+                // this bound proves the whole expansion fits, without probing
+                // the graph twice or allocating a per-expansion dedup set.
+                true
+            } else {
+                // Near the cap retain the exact reservation rule, including
+                // bypassed empty-hold nodes and duplicates within this batch.
+                capacity_keys.clear();
+                let child_layer = &self.layers[selected.depth + 1];
+                let needed = expansion
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.piece.is_none()
+                            || (child_layer
+                                .lookup
+                                .get_hashed(&edge.board, edge.hash)
+                                .is_none()
+                                && capacity_keys
+                                    .insert_if_absent_hashed(edge.board, edge.hash, 0)
+                                    .1)
+                    })
+                    .count();
+                node_count + needed <= self.config.max_nodes
+            };
+            if !fits {
                 self.counters.memory_limited = true;
                 break;
             }
 
             let start = self.layers[selected.depth].edges.len() as u32;
-            let mut edges = Vec::with_capacity(expansion.edges.len());
-            for planned in expansion.edges {
-                let child_layer = &mut self.layers[selected.depth + 1];
-                let (node, fresh) =
-                    child_layer.add_node(planned.board, selected.node, planned.piece.is_none());
-                if fresh {
-                    evaluations.push((selected.depth + 1, node, planned.board));
-                    node_count += 1;
-                } else {
-                    self.counters.transpositions += 1;
+            #[cfg(not(feature = "fast-registration"))]
+            {
+                let mut edges = Vec::with_capacity(expansion.edges.len());
+                for planned in expansion.edges {
+                    let child_layer = &mut self.layers[selected.depth + 1];
+                    let (node, fresh) =
+                        child_layer.add_node(planned.board, selected.node, planned.piece.is_none());
+                    if fresh {
+                        evaluations.push((selected.depth + 1, node, planned.board));
+                        node_count += 1;
+                    } else {
+                        self.counters.transpositions += 1;
+                    }
+                    edges.push(Edge {
+                        node,
+                        piece: planned.piece,
+                        reward: planned.reward,
+                        time: planned.time,
+                    });
                 }
-                edges.push(Edge {
-                    node,
-                    piece: planned.piece,
-                    reward: planned.reward,
-                    time: planned.time,
-                });
+                self.layers[selected.depth].edges.extend(edges);
             }
-            self.layers[selected.depth].edges.extend(edges);
+            #[cfg(feature = "fast-registration")]
+            {
+                // The accepted move set can append directly to its parent
+                // layer: each child and parent link is registered in the same
+                // order, while avoiding a temporary edge allocation and copy.
+                let layers = self.layers.make_contiguous();
+                let (before, after) = layers.split_at_mut(selected.depth + 1);
+                let current = &mut before[selected.depth];
+                let child_layer = &mut after[0];
+                current.edges.reserve(expansion.edges.len());
+                for planned in expansion.edges {
+                    let (node, fresh) = child_layer.add_node_hashed(
+                        planned.board,
+                        planned.hash,
+                        selected.node,
+                        planned.piece.is_none(),
+                    );
+                    if fresh {
+                        evaluations.push((selected.depth + 1, node, planned.board));
+                        node_count += 1;
+                    } else {
+                        self.counters.transpositions += 1;
+                    }
+                    current.edges.push(Edge {
+                        node,
+                        piece: planned.piece,
+                        reward: planned.reward,
+                        time: planned.time,
+                    });
+                }
+            }
             self.layers[selected.depth].nodes[selected.node as usize].children = Some(Children {
                 start,
                 lengths: expansion.lengths,
@@ -1163,6 +1263,8 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
                 let placement = LockResult::default();
                 output.edges.push(PlannedEdge {
                     board,
+                    #[cfg(feature = "fast-registration")]
+                    hash: board_hash(&board),
                     piece: None,
                     reward: evaluate_move(
                         3,
@@ -1230,6 +1332,8 @@ fn append_placements(
         let time = placement.time + i32::from(hold);
         output.push(PlannedEdge {
             board: after,
+            #[cfg(feature = "fast-registration")]
+            hash: board_hash(&after),
             piece: Some(placement.piece),
             reward: evaluate_move(
                 time,
@@ -1366,6 +1470,99 @@ mod tests {
         search.propagate(vec![Vec::new(), vec![child]]);
         assert_eq!(search.layers[0].nodes[0].value, value(712, 9));
         assert_eq!(search.layers[0].nodes[1].value, value(712, 9));
+    }
+
+    #[test]
+    fn empty_hold_bypasses_lookup_without_replacing_a_shared_node() {
+        let mut layer = Layer::default();
+        let board = Board::default();
+        let (shared, fresh) = layer.add_node(board, 11, false);
+        assert!(fresh);
+        let (held, fresh) = layer.add_node(board, 22, true);
+        assert!(fresh);
+        assert_ne!(shared, held);
+        let (same, fresh) = layer.add_node(board, 33, false);
+        assert!(!fresh);
+        assert_eq!(same, shared);
+        assert_eq!(layer.nodes.len(), 2);
+        assert_eq!(layer.parents.len(), 3);
+        assert_eq!(layer.lookup.get(&board), Some(&shared));
+
+        let newest = layer.parents[layer.nodes[shared as usize].parent_head as usize];
+        assert_eq!(newest.parent, 33);
+        let oldest = layer.parents[newest.next as usize];
+        assert_eq!(oldest.parent, 11);
+        assert_eq!(oldest.next, NONE);
+        let held_parent = layer.parents[layer.nodes[held as usize].parent_head as usize];
+        assert_eq!(held_parent.parent, 22);
+        assert_eq!(held_parent.next, NONE);
+    }
+
+    #[test]
+    fn a_complete_duplicate_expansion_fits_at_the_node_cap() {
+        let mut search = search();
+        search.config.use_hold = false;
+        search.start(Board::default(), vec![PieceKind::I]);
+        let selected = Selected {
+            depth: 0,
+            node: 0,
+            board: *search.board(),
+            can_hold: true,
+            candidates: 1 << PieceKind::I as u8,
+        };
+        let expansion = make_expansion(selected, false, &search.weights);
+        let mut children = Layer::default();
+        for planned in expansion.edges {
+            children.add_node(planned.board, 0, false);
+        }
+        search.layers.push_back(children);
+        let before = search.stats().nodes;
+        search.config.max_nodes = before;
+
+        assert_eq!(search.search_batch(), 1);
+        assert_eq!(search.stats().nodes, before);
+        assert!(!search.stats().memory_limited);
+        assert!(search.layers[0].nodes[0].children.is_some());
+        assert!(search.stats().transpositions > 0);
+    }
+
+    #[test]
+    fn rejected_partial_duplicate_expansion_does_not_modify_the_graph() {
+        let mut search = search();
+        search.config.use_hold = false;
+        search.start(Board::default(), vec![PieceKind::I]);
+        let selected = Selected {
+            depth: 0,
+            node: 0,
+            board: *search.board(),
+            can_hold: true,
+            candidates: 1 << PieceKind::I as u8,
+        };
+        let expansion = make_expansion(selected, false, &search.weights);
+        let unique = expansion
+            .edges
+            .iter()
+            .map(|planned| planned.board)
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(unique > 1);
+        let mut children = Layer::default();
+        children.add_node(expansion.edges[0].board, 0, false);
+        search.layers.push_back(children);
+        // Existing root + all unique children would require unique + 1 nodes.
+        search.config.max_nodes = unique;
+        let before = search.stats().nodes;
+        let parent_count = search.layers[1].parents.len();
+        let lookup_count = search.layers[1].lookup.keys().count();
+
+        assert_eq!(search.search_batch(), 0);
+        assert!(search.stats().memory_limited);
+        assert_eq!(search.stats().nodes, before);
+        assert_eq!(search.layers[1].parents.len(), parent_count);
+        assert_eq!(search.layers[1].lookup.keys().count(), lookup_count);
+        assert!(search.layers[0].edges.is_empty());
+        assert!(search.layers[0].nodes[0].children.is_none());
+        assert_eq!(search.stats().transpositions, 0);
     }
 
     #[test]

@@ -18,7 +18,7 @@ target/release/hikari_rei selfplay --pieces 100 --ms-per-move 20 \
 
 # 実時間で3分プレイし、入力・盤面・探索統計を記録
 target/release/hikari_rei ultra --threads 4 --max-nodes 8000000 \
-  --seed 10000000 --output runs/ultra/hikari-rust/replay.json
+  --seed 1 --output runs/ultra/hikari-rust/replay.json
 
 # JSON行単位のTetris Bot Protocol。startから継続して先読み
 target/release/hikari_rei tbp --threads 1
@@ -34,10 +34,10 @@ target/release/hikari_rei tbp --threads 1
 
 `ultra` はHikari規則による180秒のプレイ記録モードです。3秒のカウントダウン前から探索し、移動・ソフトドロップ・待ち時間の間も探索を継続します。公開情報は現在のミノと5個のNEXTで、手の確定後に盤面とqueueの一致を確認します。攻撃は `SimpleBoard` の値を集計し、スコアは未実装です。
 
-元コードとの対応、差分、測定結果は [docs/PORT.md](docs/PORT.md) に記録します。自己対局とUltraは元Hikariの盤面規則を使った動作確認です。cold-clear-2との対戦は、今回の移植でまだ測定していません。
+グラフ登録には、盤面全体を比較する専用の照合表を既定で使います。参照用の登録方式で動かす場合は `--no-default-features` を指定してください。
 
-低盤面の移動生成を省略する実験機能は既定では無効です。速度と配置の取りこぼしを比較した結果、ビルド方法は [docs/LOW_STACK_EXPERIMENT.md](docs/LOW_STACK_EXPERIMENT.md) にあります。
+`fast-low-stack` featureは、低い盤面で空中の移動・回転経路を事前計算します。`prune-low-stack` はさらに地形の上へ戻る状態を省略する近似探索です。配置の取りこぼしや操作コスト・順序の変更があり得るため、両方とも既定では無効です。
 
-配置生成・評価・グラフ登録などの処理時間の実測は [docs/SEARCH_PROFILE.md](docs/SEARCH_PROFILE.md) にあります。計測は `profile-search` featureを有効にしたときだけ行います。
+`profile-search` featureは、配置生成・評価・グラフ登録などの工程別実時間とCPU時間を計測します。`examples/profile_probe.rs` と `tools/profile_search.py` で計測できます。通常ビルドでは計測用のタイマーと集計フィールドは除かれます。
 
-置き換え前のNN/MCTS実装は、退避コピー・モデル・実験出力・専用Python環境・加工済み学習データを含めて削除しました。Hikari原典、取得元データ、評価用seed、現在のRust版の検証結果とUltraリプレイは保存しています。
+生成したリプレイ・ベンチマーク結果・ログは、Git管理外の `runs/` に保存します。リポジトリの文書には恒久的な仕様・設計・使い方を記載します。
