@@ -92,6 +92,70 @@ pub struct SearchStats {
     pub retained_after_advance: usize,
 }
 
+/// Optional profiling counters, accumulated since `start`.
+///
+/// The five phase wall times are sequential, non-overlapping controller times.
+/// Worker times instead sum individual tasks and may exceed wall time when
+/// several threads run concurrently. CPU times exclude descheduling and are
+/// zero on platforms without the optional thread CPU clock.
+#[cfg(feature = "profile-search")]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ProfileStats {
+    pub selection_wall_ns: u64,
+    pub expansion_wall_ns: u64,
+    pub registration_wall_ns: u64,
+    pub evaluation_wall_ns: u64,
+    pub backpropagation_wall_ns: u64,
+    /// Controller thread only: excludes parallel selection workers.
+    pub selection_cpu_ns: u64,
+    pub registration_cpu_ns: u64,
+    /// Controller thread only; covers the full evaluation stage with one worker.
+    pub evaluation_cpu_ns: u64,
+    pub backpropagation_cpu_ns: u64,
+    pub expansion_worker_wall_ns: u64,
+    pub movegen_worker_wall_ns: u64,
+    pub expansion_worker_cpu_ns: u64,
+    pub movegen_worker_cpu_ns: u64,
+    pub expansion_count: u64,
+    pub movegen_calls: u64,
+    pub evaluated_boards: u64,
+    pub batches: u64,
+}
+
+#[cfg(feature = "profile-search")]
+#[derive(Default)]
+struct ExpansionProfile {
+    expansion_wall_ns: u64,
+    expansion_cpu_ns: u64,
+    movegen_wall_ns: u64,
+    movegen_cpu_ns: u64,
+    movegen_calls: u64,
+}
+
+#[cfg(feature = "profile-search")]
+struct ProfileClock {
+    wall: Instant,
+    cpu: Option<u64>,
+}
+
+#[cfg(feature = "profile-search")]
+impl ProfileClock {
+    fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cpu: crate::profile_clock::thread_cpu_ns(),
+        }
+    }
+
+    fn elapsed(&self) -> (u64, u64) {
+        let cpu = match (self.cpu, crate::profile_clock::thread_cpu_ns()) {
+            (Some(start), Some(end)) => end.saturating_sub(start),
+            _ => 0,
+        };
+        (self.wall.elapsed().as_nanos() as u64, cpu)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ChosenMove {
     /// None is the original Hikari empty-hold-only transition.
@@ -224,6 +288,8 @@ struct Expansion {
     edges: Vec<PlannedEdge>,
     lengths: [u16; 7],
     dead: bool,
+    #[cfg(feature = "profile-search")]
+    profile: ExpansionProfile,
 }
 
 #[derive(Clone, Copy)]
@@ -272,6 +338,8 @@ pub struct Search {
     rng: Random,
     pool: Option<rayon::ThreadPool>,
     counters: SearchStats,
+    #[cfg(feature = "profile-search")]
+    profile: ProfileStats,
     epoch: u64,
     started: bool,
     root_can_hold: bool,
@@ -304,6 +372,8 @@ impl Search {
             rng,
             pool,
             counters: SearchStats::default(),
+            #[cfg(feature = "profile-search")]
+            profile: ProfileStats::default(),
             epoch: 0,
             started: false,
             root_can_hold: true,
@@ -324,6 +394,10 @@ impl Search {
         self.root = 0;
         self.rng = Random::new(self.config.seed);
         self.counters = SearchStats::default();
+        #[cfg(feature = "profile-search")]
+        {
+            self.profile = ProfileStats::default();
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.started = true;
         self.root_can_hold = true;
@@ -449,6 +523,9 @@ impl Search {
             return 0;
         }
 
+        #[cfg(feature = "profile-search")]
+        let selection_clock = ProfileClock::start();
+
         // Hikari's MaxDepth counts populated layers, including the root. Once
         // the rebuilt graph catches the old plan, the guidance has done its job.
         if !self.select_guidance.is_empty()
@@ -477,6 +554,13 @@ impl Search {
             }
         }
         self.counters.batches += 1;
+        #[cfg(feature = "profile-search")]
+        {
+            let (wall, cpu) = selection_clock.elapsed();
+            self.profile.selection_wall_ns += wall;
+            self.profile.selection_cpu_ns += cpu;
+            self.profile.batches += 1;
+        }
         if selections.is_empty() {
             return 0;
         }
@@ -484,6 +568,8 @@ impl Search {
     }
 
     fn expand_selections(&mut self, selections: Vec<Selected>) -> usize {
+        #[cfg(feature = "profile-search")]
+        let expansion_clock = Instant::now();
         let weights = &self.weights;
         let use_hold = self.config.use_hold;
         let expand = |selected: &Selected| make_expansion(*selected, use_hold, weights);
@@ -492,6 +578,21 @@ impl Search {
         } else {
             selections.iter().map(expand).collect()
         };
+        #[cfg(feature = "profile-search")]
+        {
+            self.profile.expansion_wall_ns += expansion_clock.elapsed().as_nanos() as u64;
+        }
+        #[cfg(feature = "profile-search")]
+        let registration_clock = ProfileClock::start();
+        #[cfg(feature = "profile-search")]
+        for expansion in &expansions {
+            self.profile.expansion_worker_wall_ns += expansion.profile.expansion_wall_ns;
+            self.profile.movegen_worker_wall_ns += expansion.profile.movegen_wall_ns;
+            self.profile.expansion_worker_cpu_ns += expansion.profile.expansion_cpu_ns;
+            self.profile.movegen_worker_cpu_ns += expansion.profile.movegen_cpu_ns;
+            self.profile.movegen_calls += expansion.profile.movegen_calls;
+            self.profile.expansion_count += 1;
+        }
         self.counters.generated += expansions
             .iter()
             .map(|expansion| expansion.edges.len() as u64)
@@ -570,6 +671,16 @@ impl Search {
             expanded += 1;
         }
 
+        #[cfg(feature = "profile-search")]
+        {
+            let (wall, cpu) = registration_clock.elapsed();
+            self.profile.registration_wall_ns += wall;
+            self.profile.registration_cpu_ns += cpu;
+            self.profile.evaluated_boards += evaluations.len() as u64;
+        }
+        #[cfg(feature = "profile-search")]
+        let evaluation_clock = ProfileClock::start();
+
         // The graph has already merged transpositions, so each newly inserted
         // board is evaluated once, even when many expansion parents found it.
         let evaluate = |&(depth, node, board): &(usize, u32, Board)| {
@@ -583,8 +694,22 @@ impl Search {
         for (depth, node, value) in values {
             self.layers[depth].nodes[node as usize].value = value;
         }
+        #[cfg(feature = "profile-search")]
+        {
+            let (wall, cpu) = evaluation_clock.elapsed();
+            self.profile.evaluation_wall_ns += wall;
+            self.profile.evaluation_cpu_ns += cpu;
+        }
+        #[cfg(feature = "profile-search")]
+        let backpropagation_clock = ProfileClock::start();
         self.counters.expanded += expanded as u64;
         self.propagate(updates);
+        #[cfg(feature = "profile-search")]
+        {
+            let (wall, cpu) = backpropagation_clock.elapsed();
+            self.profile.backpropagation_wall_ns += wall;
+            self.profile.backpropagation_cpu_ns += cpu;
+        }
         expanded
     }
 
@@ -957,6 +1082,12 @@ impl Search {
         result.dead = self.started && self.layers[0].nodes[self.root as usize].dead;
         result
     }
+
+    /// Cumulative optional instrumentation; absent from normal builds.
+    #[cfg(feature = "profile-search")]
+    pub fn profile(&self) -> ProfileStats {
+        self.profile
+    }
 }
 
 fn apply_transition(board: &mut Board, current: PieceKind, piece: Option<Piece>) {
@@ -982,11 +1113,15 @@ fn apply_transition(board: &mut Board, current: PieceKind, piece: Option<Piece>)
 }
 
 fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expansion {
+    #[cfg(feature = "profile-search")]
+    let clock = ProfileClock::start();
     let mut output = Expansion {
         selected,
         edges: Vec::new(),
         lengths: [0; 7],
         dead: false,
+        #[cfg(feature = "profile-search")]
+        profile: ExpansionProfile::default(),
     };
     // Mirai caches movements for both current and held piece in one instance.
     // Here each distinct kind is generated once and shared among draw cases.
@@ -1003,6 +1138,8 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
             false,
             weights,
             &mut moves,
+            #[cfg(feature = "profile-search")]
+            &mut output.profile,
         );
         if use_hold && selected.can_hold {
             if let Some(held) = selected.board.hold {
@@ -1016,6 +1153,8 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
                         true,
                         weights,
                         &mut moves,
+                        #[cfg(feature = "profile-search")]
+                        &mut output.profile,
                     );
                 }
             } else {
@@ -1047,9 +1186,19 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
             break;
         }
     }
+    // Include cache destruction in expansion work, as it also happens in
+    // ordinary builds before returning the expansion result to the controller.
+    drop(moves);
+    #[cfg(feature = "profile-search")]
+    {
+        let (wall, cpu) = clock.elapsed();
+        output.profile.expansion_wall_ns = wall;
+        output.profile.expansion_cpu_ns = cpu;
+    }
     output
 }
 
+#[cfg_attr(feature = "profile-search", allow(clippy::too_many_arguments))]
 fn append_placements(
     output: &mut Vec<PlannedEdge>,
     board: Board,
@@ -1057,8 +1206,21 @@ fn append_placements(
     hold: bool,
     weights: &Weights,
     moves: &mut [Option<Vec<movegen::Placement>>; 7],
+    #[cfg(feature = "profile-search")] profile: &mut ExpansionProfile,
 ) {
-    let placements = moves[kind as usize].get_or_insert_with(|| movegen::generate(&board, kind));
+    let placements = moves[kind as usize].get_or_insert_with(|| {
+        #[cfg(feature = "profile-search")]
+        let clock = ProfileClock::start();
+        let placements = movegen::generate(&board, kind);
+        #[cfg(feature = "profile-search")]
+        {
+            let (wall, cpu) = clock.elapsed();
+            profile.movegen_wall_ns += wall;
+            profile.movegen_cpu_ns += cpu;
+            profile.movegen_calls += 1;
+        }
+        placements
+    });
     for placement in placements.iter() {
         let mut after = board;
         let result = after.lock(placement.piece);
@@ -1147,6 +1309,35 @@ mod tests {
             reward: Reward::default(),
             time: 0,
         }
+    }
+
+    #[cfg(feature = "profile-search")]
+    #[test]
+    fn profiling_accounts_for_completed_work_and_resets_on_start() {
+        let mut search = search();
+        let queue = vec![PieceKind::T, PieceKind::I, PieceKind::O];
+        search.start(Board::default(), queue.clone());
+        for _ in 0..8 {
+            search.search_batch();
+        }
+        let profile = search.profile();
+        let stats = search.stats();
+        assert_eq!(profile.batches, stats.batches);
+        assert_eq!(profile.expansion_count, stats.expanded);
+        assert_eq!(profile.evaluated_boards as usize, stats.nodes - 1);
+        assert!(profile.movegen_calls > 0);
+        assert!(profile.movegen_worker_wall_ns > 0);
+        assert!(profile.movegen_worker_wall_ns <= profile.expansion_worker_wall_ns);
+        assert!(profile.movegen_worker_cpu_ns <= profile.expansion_worker_cpu_ns);
+        assert!(profile.selection_wall_ns > 0);
+        assert!(profile.expansion_wall_ns > 0);
+        assert!(profile.registration_wall_ns > 0);
+        assert!(profile.evaluation_wall_ns > 0);
+        assert!(profile.backpropagation_wall_ns > 0);
+        search.start(Board::default(), queue);
+        assert_eq!(search.profile().batches, 0);
+        assert_eq!(search.profile().movegen_calls, 0);
+        assert_eq!(search.profile().movegen_worker_wall_ns, 0);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 pub mod board;
 pub mod eval;
 pub mod movegen;
+#[cfg(feature = "profile-search")]
+pub mod profile_clock;
 pub mod protocol;
 pub mod search;
 pub mod ultra;
