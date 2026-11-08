@@ -274,22 +274,38 @@ impl Layer {
 
     #[cfg(all(feature = "fast-registration", test))]
     fn add_node(&mut self, key: Board, parent: u32, bypass: bool) -> (u32, bool) {
-        self.add_node_hashed(key, board_hash(&key), parent, bypass)
+        self.add_node_hashed(&key, board_hash(&key), parent, bypass)
     }
 
     #[cfg(feature = "fast-registration")]
-    fn add_node_hashed(&mut self, key: Board, hash: u64, parent: u32, bypass: bool) -> (u32, bool) {
+    #[inline(always)]
+    fn add_node_hashed(
+        &mut self,
+        key: &Board,
+        hash: u64,
+        parent: u32,
+        bypass: bool,
+    ) -> (u32, bool) {
         let next_index = self.nodes.len() as u32;
         let (index, fresh) = if bypass {
             (next_index, true)
         } else {
-            self.lookup.insert_if_absent_hashed(key, hash, next_index)
+            self.lookup
+                .insert_if_absent_hashed_ref(key, hash, next_index)
         };
-        if fresh {
-            self.nodes.push(Node::new(Value::default()));
-        }
-        let next = self.nodes[index as usize].parent_head;
-        self.nodes[index as usize].parent_head = self.parents.len() as u32;
+        let parent_head = self.parents.len() as u32;
+        let next = if fresh {
+            // A fresh node has no previous incoming link. Initialize its head
+            // directly instead of writing NONE, reading it back, then replacing.
+            self.nodes.push(Node {
+                parent_head,
+                ..Node::new(Value::default())
+            });
+            NONE
+        } else {
+            let node = &mut self.nodes[index as usize];
+            std::mem::replace(&mut node.parent_head, parent_head)
+        };
         self.parents.push(ParentLink { parent, next });
         (index, fresh)
     }
@@ -634,13 +650,38 @@ impl Search {
         while self.layers.len() < required_layers {
             self.layers.push_back(Layer::default());
         }
-        let mut updates = vec![Vec::new(); self.layers.len()];
-        let mut evaluations = Vec::new();
-        let mut node_count = self
-            .layers
-            .iter()
-            .map(|layer| layer.nodes.len())
-            .sum::<usize>();
+        // Each selected leaf contributes all its edges to the same adjacent
+        // layers. Reserve these append buffers once for the whole batch, before
+        // writing any graph records, so Vec growth does not repeatedly copy the
+        // large Board evaluation records or densely packed graph arrays.
+        let layers = self.layers.make_contiguous();
+        let mut edge_capacity = vec![0; layers.len()];
+        let mut update_capacity = vec![0; layers.len()];
+        for expansion in &expansions {
+            let depth = expansion.selected.depth;
+            update_capacity[depth] += 1;
+            if !expansion.dead {
+                edge_capacity[depth] += expansion.edges.len();
+            }
+        }
+        let mut node_count = layers.iter().map(|layer| layer.nodes.len()).sum::<usize>();
+        let remaining_nodes = self.config.max_nodes - node_count;
+        let candidates = edge_capacity.iter().sum::<usize>();
+        let mut evaluations = Vec::with_capacity(candidates.min(remaining_nodes));
+        let mut updates: Vec<Vec<u32>> = update_capacity
+            .into_iter()
+            .map(Vec::with_capacity)
+            .collect();
+        for depth in 0..layers.len() {
+            layers[depth].edges.reserve(edge_capacity[depth]);
+            if depth > 0 {
+                let incoming = edge_capacity[depth - 1];
+                layers[depth].parents.reserve(incoming);
+                layers[depth].nodes.reserve(incoming.min(remaining_nodes));
+                #[cfg(feature = "fast-registration")]
+                layers[depth].lookup.reserve(incoming.min(remaining_nodes));
+            }
+        }
         let mut expanded = 0;
         #[cfg(feature = "fast-registration")]
         let mut capacity_keys = BoardLookup::default();
@@ -648,7 +689,7 @@ impl Search {
         for expansion in expansions {
             let selected = expansion.selected;
             if expansion.dead {
-                self.layers[selected.depth].nodes[selected.node as usize].dead = true;
+                layers[selected.depth].nodes[selected.node as usize].dead = true;
                 updates[selected.depth].push(selected.node);
                 expanded += 1;
                 continue;
@@ -659,7 +700,7 @@ impl Search {
             #[cfg(not(feature = "fast-registration"))]
             let fits = {
                 let mut fresh_keys = HashSet::new();
-                let child_layer = &self.layers[selected.depth + 1];
+                let child_layer = &layers[selected.depth + 1];
                 let needed = expansion
                     .edges
                     .iter()
@@ -681,7 +722,7 @@ impl Search {
                 // Near the cap retain the exact reservation rule, including
                 // bypassed empty-hold nodes and duplicates within this batch.
                 capacity_keys.clear();
-                let child_layer = &self.layers[selected.depth + 1];
+                let child_layer = &layers[selected.depth + 1];
                 let needed = expansion
                     .edges
                     .iter()
@@ -703,61 +744,54 @@ impl Search {
                 break;
             }
 
-            let start = self.layers[selected.depth].edges.len() as u32;
-            #[cfg(not(feature = "fast-registration"))]
-            {
-                let mut edges = Vec::with_capacity(expansion.edges.len());
-                for planned in expansion.edges {
-                    let child_layer = &mut self.layers[selected.depth + 1];
-                    let (node, fresh) =
-                        child_layer.add_node(planned.board, selected.node, planned.piece.is_none());
-                    if fresh {
-                        evaluations.push((selected.depth + 1, node, planned.board));
-                        node_count += 1;
-                    } else {
-                        self.counters.transpositions += 1;
-                    }
-                    edges.push(Edge {
-                        node,
-                        piece: planned.piece,
-                        reward: planned.reward,
-                        time: planned.time,
-                    });
-                }
-                self.layers[selected.depth].edges.extend(edges);
-            }
+            // Both layers stay borrowed for the accepted expansion. Taking a
+            // single contiguous view of the deque per batch also avoids its
+            // wraparound indexing in every candidate registration.
+            let (before, after) = layers.split_at_mut(selected.depth + 1);
+            let current = &mut before[selected.depth];
+            let child_layer = &mut after[0];
+            let start = current.edges.len() as u32;
             #[cfg(feature = "fast-registration")]
-            {
-                // The accepted move set can append directly to its parent
-                // layer: each child and parent link is registered in the same
-                // order, while avoiding a temporary edge allocation and copy.
-                let layers = self.layers.make_contiguous();
-                let (before, after) = layers.split_at_mut(selected.depth + 1);
-                let current = &mut before[selected.depth];
-                let child_layer = &mut after[0];
-                current.edges.reserve(expansion.edges.len());
-                for planned in expansion.edges {
-                    let (node, fresh) = child_layer.add_node_hashed(
-                        planned.board,
-                        planned.hash,
-                        selected.node,
-                        planned.piece.is_none(),
-                    );
-                    if fresh {
-                        evaluations.push((selected.depth + 1, node, planned.board));
-                        node_count += 1;
-                    } else {
-                        self.counters.transpositions += 1;
-                    }
-                    current.edges.push(Edge {
-                        node,
-                        piece: planned.piece,
-                        reward: planned.reward,
-                        time: planned.time,
-                    });
-                }
+            for planned in expansion.edges.iter().take(16) {
+                child_layer.lookup.prefetch(planned.hash);
+                child_layer.lookup.prefetch_record(planned.hash);
             }
-            self.layers[selected.depth].nodes[selected.node as usize].children = Some(Children {
+            for (candidate, planned) in expansion.edges.iter().enumerate() {
+                #[cfg(not(feature = "fast-registration"))]
+                let _ = candidate;
+                #[cfg(feature = "fast-registration")]
+                {
+                    if let Some(future) = expansion.edges.get(candidate + 16) {
+                        child_layer.lookup.prefetch(future.hash);
+                    }
+                    if let Some(future) = expansion.edges.get(candidate + 8) {
+                        child_layer.lookup.prefetch_record(future.hash);
+                    }
+                }
+                #[cfg(not(feature = "fast-registration"))]
+                let (node, fresh) =
+                    child_layer.add_node(planned.board, selected.node, planned.piece.is_none());
+                #[cfg(feature = "fast-registration")]
+                let (node, fresh) = child_layer.add_node_hashed(
+                    &planned.board,
+                    planned.hash,
+                    selected.node,
+                    planned.piece.is_none(),
+                );
+                if fresh {
+                    evaluations.push((selected.depth + 1, node, planned.board));
+                    node_count += 1;
+                } else {
+                    self.counters.transpositions += 1;
+                }
+                current.edges.push(Edge {
+                    node,
+                    piece: planned.piece,
+                    reward: planned.reward,
+                    time: planned.time,
+                });
+            }
+            current.nodes[selected.node as usize].children = Some(Children {
                 start,
                 lengths: expansion.lengths,
                 possibilities: selected.candidates,
@@ -1550,6 +1584,129 @@ mod tests {
         assert!(search.layers[0].edges.is_empty());
         assert!(search.layers[0].nodes[0].children.is_none());
         assert_eq!(search.stats().transpositions, 0);
+    }
+
+    #[test]
+    fn mixed_duplicate_and_empty_hold_batches_respect_the_exact_node_cap() {
+        // Two parents discover the same placements and the same empty-hold
+        // board. Real placements merge; each hold must allocate a separate node,
+        // even when that exact board already has a shared lookup entry.
+        for accepted in [2_usize, 1] {
+            let mut search = search();
+            search.start(Board::default(), vec![PieceKind::I]);
+            search.layers[0].nodes.push(Node::new(Value::default()));
+            let first = Selected {
+                depth: 0,
+                node: 0,
+                board: *search.board(),
+                can_hold: true,
+                candidates: 1 << PieceKind::I as u8,
+            };
+            let plans = make_expansion(first, true, &search.weights);
+            let planned: Vec<_> = plans
+                .edges
+                .iter()
+                .map(|edge| (edge.board, edge.piece))
+                .collect();
+            let held_board = planned.iter().find(|(_, piece)| piece.is_none()).unwrap().0;
+            let placed_board = planned.iter().find(|(_, piece)| piece.is_some()).unwrap().0;
+            let unique_placements = planned
+                .iter()
+                .filter(|(_, piece)| piece.is_some())
+                .map(|(board, _)| *board)
+                .collect::<HashSet<_>>()
+                .len();
+            let mut child_layer = Layer::default();
+            assert_eq!(child_layer.add_node(held_board, 0, false), (0, true));
+            assert_eq!(child_layer.add_node(placed_board, 0, false), (1, true));
+            search.layers.push_back(child_layer);
+            // Four existing nodes, all unseeded placements, and two bypassed
+            // holds fit exactly. One fewer permits only the first whole parent.
+            search.config.max_nodes = 4 + (unique_placements - 1) + 2 - (2 - accepted);
+
+            let mut expected_boards = vec![held_board, placed_board];
+            let mut expected_lookup =
+                std::collections::HashMap::from([(held_board, 0_u32), (placed_board, 1)]);
+            let mut expected_heads = vec![0_u32, 1];
+            let mut expected_parents = vec![(0_u32, NONE), (0, NONE)];
+            let mut expected_edges = Vec::new();
+            let mut transpositions = 0;
+            for parent in 0..accepted as u32 {
+                let mut edges = Vec::new();
+                for &(board, piece) in &planned {
+                    let existing = piece.and_then(|_| expected_lookup.get(&board).copied());
+                    let node = if let Some(node) = existing {
+                        transpositions += 1;
+                        node
+                    } else {
+                        let node = expected_boards.len() as u32;
+                        expected_boards.push(board);
+                        expected_heads.push(NONE);
+                        if piece.is_some() {
+                            expected_lookup.insert(board, node);
+                        }
+                        node
+                    };
+                    let next = expected_heads[node as usize];
+                    expected_heads[node as usize] = expected_parents.len() as u32;
+                    expected_parents.push((parent, next));
+                    edges.push((piece, node));
+                }
+                expected_edges.push(edges);
+            }
+
+            assert_eq!(
+                search.expand_selections(vec![first, Selected { node: 1, ..first }]),
+                accepted
+            );
+            let stats = search.stats();
+            assert_eq!(stats.nodes, search.config.max_nodes);
+            assert_eq!(stats.nodes, expected_boards.len() + 2);
+            assert_eq!(stats.edges, planned.len() * accepted);
+            assert_eq!(stats.generated, (planned.len() * 2) as u64);
+            assert_eq!(stats.expanded, accepted as u64);
+            assert_eq!(stats.transpositions, transpositions);
+            assert_eq!(stats.memory_limited, accepted == 1);
+            assert!(!stats.dead);
+            let children = &search.layers[1];
+            assert_eq!(children.lookup.keys().count(), expected_lookup.len());
+            for (board, node) in expected_lookup {
+                assert_eq!(children.lookup.get(&board), Some(&node));
+            }
+            assert_eq!(children.parents.len(), expected_parents.len());
+            for (actual, &(parent, next)) in children.parents.iter().zip(&expected_parents) {
+                assert_eq!((actual.parent, actual.next), (parent, next));
+            }
+            for (index, node) in children.nodes.iter().enumerate() {
+                assert_eq!(node.parent_head, expected_heads[index]);
+                let expected_value = if index < 2 {
+                    Value::default()
+                } else {
+                    evaluate_board(&expected_boards[index], &search.weights)
+                };
+                assert_eq!(node.value, expected_value);
+            }
+            for (parent, edges) in expected_edges.iter().enumerate() {
+                let range = search.layers[0].nodes[parent]
+                    .children
+                    .unwrap()
+                    .range(PieceKind::I);
+                let actual = &search.layers[0].edges[range];
+                assert_eq!(actual.len(), edges.len());
+                for &(piece, node) in edges {
+                    assert_eq!(
+                        actual.iter().find(|edge| edge.piece == piece).unwrap().node,
+                        node
+                    );
+                }
+            }
+            if accepted == 1 {
+                // The rejected parent's complete edge set, parent links, fresh
+                // hold, and children metadata must all remain unregistered.
+                assert!(search.layers[0].nodes[1].children.is_none());
+                assert!(!search.layers[0].nodes[1].dead);
+            }
+        }
     }
 
     #[test]

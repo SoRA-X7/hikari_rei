@@ -40,4 +40,6 @@ target/release/hikari_rei tbp --threads 1
 
 `profile-search` featureは、配置生成・評価・グラフ登録などの工程別実時間とCPU時間を計測します。`examples/profile_probe.rs` と `tools/profile_search.py` で計測できます。通常ビルドでは計測用のタイマーと集計フィールドは除かれます。
 
+`tools/benchmark_registration.py` は、変更前後の通常ビルドと `profile-search` ビルドを比較し、同一仕事量での結果一致、ノード上限、探索速度、登録時間を検証します。既定の照合表同士を比較するときは `--baseline-fast-registration` を指定します。工程別計測は乱数を変えて3回繰り返し、`--profile-trials` で回数を変更できます。別のソースツリーをビルドする場合は、それぞれ異なる `--target-dir` を使ってください。
+
 生成したリプレイ・ベンチマーク結果・ログは、Git管理外の `runs/` に保存します。リポジトリの文書には恒久的な仕様・設計・使い方を記載します。
