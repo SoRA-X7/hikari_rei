@@ -190,6 +190,51 @@ pub const SHAPES: [[[u16; 4]; 4]; 7] = [
     [[0, 6, 3, 0], [2, 6, 4, 0], [6, 3, 0, 0], [1, 3, 2, 0]],
 ];
 
+// Match the native ordering of four adjacent board rows in a u64 load.
+const PACKED_SHAPES: [[u64; 4]; 7] = {
+    let mut packed = [[0; 4]; 7];
+    let mut kind = 0;
+    while kind < 7 {
+        let mut rotation = 0;
+        while rotation < 4 {
+            let mut row = 0;
+            while row < 4 {
+                let lane = if cfg!(target_endian = "little") {
+                    row
+                } else {
+                    3 - row
+                };
+                packed[kind][rotation] |= (SHAPES[kind][rotation][row] as u64) << (16 * lane);
+                row += 1;
+            }
+            rotation += 1;
+        }
+        kind += 1;
+    }
+    packed
+};
+
+// Four 16-bit rows, with the bottom row in the low lane. The packed lock
+// path uses this table only on little-endian targets; other targets use
+// the original row loop.
+const PACKED_LOCK_SHAPES: [[u64; 4]; 7] = {
+    let mut result = [[0; 4]; 7];
+    let mut kind = 0;
+    while kind < 7 {
+        let mut rotation = 0;
+        while rotation < 4 {
+            let mut row = 0;
+            while row < 4 {
+                result[kind][rotation] |= (SHAPES[kind][rotation][row] as u64) << (row * 16);
+                row += 1;
+            }
+            rotation += 1;
+        }
+        kind += 1;
+    }
+    result
+};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Board {
     pub rows: [u16; HEIGHT],
@@ -216,11 +261,29 @@ impl Board {
             .get(y as usize)
             .is_some_and(|row| row & (1 << x) != 0)
     }
-    #[inline]
+    #[inline(always)]
     pub fn collides(&self, piece: Piece) -> bool {
         // This early return is present in SimpleBoard.Collides.
         if piece.y > HEIGHT as i8 - 3 {
             return false;
+        }
+        if (0..=HEIGHT as i8 - 4).contains(&piece.y) && (-3..=9).contains(&piece.x) {
+            // Four rows fit in this range. Their start may only be u16-aligned.
+            // SAFETY: y is at most HEIGHT - 4, so all eight bytes are inside rows.
+            let field = unsafe {
+                self.rows
+                    .as_ptr()
+                    .add(piece.y as usize)
+                    .cast::<u64>()
+                    .read_unaligned()
+            };
+            // Keep each row within its own 16-bit lane, with three wall bits
+            // on either side of the ten playable columns. The x range keeps
+            // all four shape columns inside a lane even for invalid moves.
+            let field = ((field & 0x03ff_03ff_03ff_03ff) << 3) | 0xe007_e007_e007_e007;
+            let shape =
+                PACKED_SHAPES[piece.kind as usize][piece.rotation() as usize] << (piece.x + 3);
+            return field & shape != 0;
         }
         let shape = piece.shape();
         for (dy, row) in shape.into_iter().enumerate() {
@@ -366,30 +429,62 @@ impl Board {
     pub fn lock(&mut self, piece: Piece) -> LockResult {
         let mut cleared = [0usize; 4];
         let mut count = 0;
-        let mut bottommost = true;
         let mut death = false;
-        for (dy, row) in piece.shape().into_iter().enumerate() {
-            if row == 0 {
-                continue;
+        if cfg!(target_endian = "little")
+            && (0..=HEIGHT as i8 - 4).contains(&piece.y)
+            && (-3..=12).contains(&piece.x)
+        {
+            let shape = PACKED_LOCK_SHAPES[piece.kind as usize][piece.rotation() as usize];
+            let shifted = if piece.x >= 0 {
+                shape << piece.x
+            } else {
+                // Remove bits spilling from each lane into the previous one.
+                (shape >> (-piece.x)) & 0x03ff_03ff_03ff_03ff
+            };
+            let y = piece.y as usize;
+            // SAFETY: y <= 20 leaves four initialized u16 rows inside the
+            // 24-row array; unaligned operations do not require u64 alignment.
+            // The pointer does not outlive this exclusive borrow of the board.
+            let placed = unsafe {
+                let rows = self.rows.as_mut_ptr().add(y).cast::<u64>();
+                let placed = u64::from_le(rows.read_unaligned()) | shifted;
+                rows.write_unaligned(placed.to_le());
+                placed
+            };
+            death = piece.y as i32 + (shape.trailing_zeros() >> 4) as i32 >= 20;
+            for dy in 0..4 {
+                // A pre-filled row is checked only if the original shape uses it,
+                // even when an invalid x shift discards all its cells.
+                if (shape >> (dy * 16)) as u16 != 0 && (placed >> (dy * 16)) as u16 == FILLED {
+                    cleared[count] = y + dy;
+                    count += 1;
+                }
             }
-            let y = piece.y as i32 + dy as i32;
-            if bottommost {
-                death = y >= 20;
-                bottommost = false;
-            }
-            if y >= HEIGHT as i32 {
-                break;
-            }
-            // Legal placements never have an occupied cell below zero.
-            if y < 0 {
-                death = true;
-                continue;
-            }
-            let shifted = (row as u32).rotate_left(piece.x.rem_euclid(32) as u32) as u16;
-            self.rows[y as usize] |= shifted;
-            if self.rows[y as usize] == FILLED {
-                cleared[count] = y as usize;
-                count += 1;
+        } else {
+            let mut bottommost = true;
+            for (dy, row) in piece.shape().into_iter().enumerate() {
+                if row == 0 {
+                    continue;
+                }
+                let y = piece.y as i32 + dy as i32;
+                if bottommost {
+                    death = y >= 20;
+                    bottommost = false;
+                }
+                if y >= HEIGHT as i32 {
+                    break;
+                }
+                // Legal placements never have an occupied cell below zero.
+                if y < 0 {
+                    death = true;
+                    continue;
+                }
+                let shifted = (row as u32).rotate_left(piece.x.rem_euclid(32) as u32) as u16;
+                self.rows[y as usize] |= shifted;
+                if self.rows[y as usize] == FILLED {
+                    cleared[count] = y as usize;
+                    count += 1;
+                }
             }
         }
         for (index, &row) in cleared[..count].iter().enumerate() {
@@ -478,6 +573,86 @@ const KICKS_I: [[(i8, i8); 4]; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the original row-based implementation as a differential oracle.
+    fn scalar_collides(board: &Board, piece: Piece) -> bool {
+        if piece.y > HEIGHT as i8 - 3 {
+            return false;
+        }
+        for (dy, row) in piece.shape().into_iter().enumerate() {
+            if row == 0 {
+                continue;
+            }
+            let y = piece.y as i32 + dy as i32;
+            if y < 0 {
+                return true;
+            }
+            let shifted = if piece.x >= 0 {
+                (row as u32) << piece.x
+            } else {
+                (row as u32) >> (-piece.x)
+            };
+            if piece.x < 0 && row & ((1u16 << (-piece.x).min(15)) - 1) != 0 {
+                return true;
+            }
+            if shifted & !(FILLED as u32) != 0 {
+                return true;
+            }
+            if board
+                .rows
+                .get(y as usize)
+                .is_some_and(|field| *field as u32 & shifted != 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn packed_collides_matches_scalar_on_all_piece_geometry() {
+        let mut state = 0x8f3d_2ca7_b519_64e1_u64;
+        let mut random_row = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u16
+        };
+        for board_index in 0..99 {
+            let mut board = Board::default();
+            if board_index == 1 {
+                board.rows.fill(FILLED);
+            } else if board_index == 2 {
+                // Out-of-board bits must not spill into the neighboring row.
+                board.rows.fill(!FILLED);
+            } else if board_index > 2 {
+                for row in &mut board.rows {
+                    *row = random_row();
+                    // Exercise dense and sparse boards, including unused bits.
+                    for _ in 0..board_index % 5 {
+                        *row &= random_row();
+                    }
+                }
+            }
+            for kind in PieceKind::ALL {
+                for rotation in 0..4 {
+                    for tspin in [TSpin::None, TSpin::Mini, TSpin::Full] {
+                        for x in -4..=12 {
+                            for y in -4..=25 {
+                                let piece = Piece::new(kind, x, y, rotation).with_tspin(tspin);
+                                assert_eq!(
+                                    board.collides(piece),
+                                    scalar_collides(&board, piece),
+                                    "board {board_index}, piece {piece:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn spawn_and_drop_match_hikari_coordinates() {
         let board = Board::default();
@@ -570,5 +745,129 @@ mod tests {
         );
         board.rows[21] = 1 << 4;
         assert_eq!(board.spawn(PieceKind::O), None);
+    }
+}
+
+#[cfg(test)]
+impl Board {
+    fn lock_reference(&mut self, piece: Piece) -> LockResult {
+        let mut cleared = [0usize; 4];
+        let mut count = 0;
+        let mut bottommost = true;
+        let mut death = false;
+        for (dy, row) in piece.shape().into_iter().enumerate() {
+            if row == 0 {
+                continue;
+            }
+            let y = piece.y as i32 + dy as i32;
+            if bottommost {
+                death = y >= 20;
+                bottommost = false;
+            }
+            if y >= HEIGHT as i32 {
+                break;
+            }
+            // Legal placements never have an occupied cell below zero.
+            if y < 0 {
+                death = true;
+                continue;
+            }
+            let shifted = (row as u32).rotate_left(piece.x.rem_euclid(32) as u32) as u16;
+            self.rows[y as usize] |= shifted;
+            if self.rows[y as usize] == FILLED {
+                cleared[count] = y as usize;
+                count += 1;
+            }
+        }
+        for (index, &row) in cleared[..count].iter().enumerate() {
+            for target in row - index..HEIGHT - 1 {
+                self.rows[target] = self.rows[target + 1];
+            }
+            self.rows[HEIGHT - 1 - index] = 0;
+        }
+        let perfect_clear = self.rows.iter().all(|row| *row == 0);
+        let placement = (piece.tspin() as u8) * 8 + count as u8;
+        if count != 0 {
+            self.ren += 1;
+            self.back_to_back = placement >= 4;
+        } else {
+            self.ren = 0;
+        }
+        death |= (self.rows[20] | self.rows[21]) & 0b0001111000 != 0;
+        LockResult {
+            placement,
+            death,
+            back_to_back: self.back_to_back,
+            perfect_clear,
+            ren: if count != 0 { self.ren + 1 } else { 0 },
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_lock_tests {
+    use super::*;
+
+    fn compare(board: Board, piece: Piece) {
+        let mut expected = board;
+        let mut actual = board;
+        let reference = expected.lock_reference(piece);
+        let packed = actual.lock(piece);
+        assert_eq!(
+            packed, reference,
+            "result mismatch: {piece:?}, board={board:?}"
+        );
+        assert_eq!(
+            actual, expected,
+            "board mismatch: {piece:?}, board={board:?}"
+        );
+    }
+
+    #[test]
+    fn packed_lock_matches_reference_for_every_i8_position() {
+        let board = Board::default();
+        for kind in PieceKind::ALL {
+            for rotation in 0..4 {
+                for y in i8::MIN..=i8::MAX {
+                    for x in i8::MIN..=i8::MAX {
+                        compare(board, Piece::new(kind, x, y, rotation));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_lock_matches_reference_random_and_prefilled_rows() {
+        let mut seed = 0x71ab_09cd_67ef_2345u64;
+        for sample in 0..96 {
+            let mut board = Board::default();
+            for row in &mut board.rows {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *row = match sample % 4 {
+                    0 => (seed as u16) & FILLED,
+                    1 => FILLED,
+                    2 => (seed as u16) | FILLED,
+                    _ => (seed as u16) & FILLED & !(1 << (sample % 10)),
+                };
+            }
+            board.back_to_back = sample % 2 == 0;
+            board.ren = sample % 16;
+            board.hold = PieceKind::from_index(sample as usize % 8);
+            board.bag = sample as u8;
+            for kind in PieceKind::ALL {
+                for rotation in 0..4 {
+                    for y in -4..=25 {
+                        for x in -6..=16 {
+                            for spin in [TSpin::None, TSpin::Mini, TSpin::Full] {
+                                compare(board, Piece::new(kind, x, y, rotation).with_tspin(spin));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
