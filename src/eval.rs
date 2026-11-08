@@ -376,13 +376,10 @@ pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
             } else {
                 break;
             };
-            clone.lock(Piece {
-                kind: PieceKind::T,
-                x: hole.x as i8,
-                y: hole.y as i8,
-                rotation: hole.rotation,
-                tspin: TSpin::Full,
-            });
+            clone.lock(
+                Piece::new(PieceKind::T, hole.x as i8, hole.y as i8, hole.rotation)
+                    .with_tspin(TSpin::Full),
+            );
             (columns, heights) = self::columns(&clone);
             max_height -= hole.lines;
         }
@@ -820,13 +817,7 @@ mod tests {
     #[test]
     fn move_golden_keeps_line_delay_and_offset_combo_scoring() {
         let b = board();
-        let piece = Piece {
-            kind: PieceKind::I,
-            x: 3,
-            y: 0,
-            rotation: 1,
-            tspin: TSpin::None,
-        };
+        let piece = Piece::new(PieceKind::I, 3, 0, 1);
         let lock = LockResult {
             placement: 4,
             death: false,
@@ -875,13 +866,7 @@ mod tests {
     fn danger_uses_zero_based_center_height_and_nonclear_spins_are_continuous() {
         let mut b = board();
         b.rows[18] = 1 << 3;
-        let piece = Piece {
-            kind: PieceKind::I,
-            x: 3,
-            y: 0,
-            rotation: 1,
-            tspin: TSpin::None,
-        };
+        let piece = Piece::new(PieceKind::I, 3, 0, 1);
         let lock = LockResult {
             placement: 0,
             death: false,
@@ -905,10 +890,8 @@ mod tests {
             placement: 8,
             ..lock
         };
-        let t_piece = Piece {
-            kind: PieceKind::T,
-            ..piece
-        };
+        let t_piece =
+            Piece::new(PieceKind::T, piece.x, piece.y, piece.rotation()).with_tspin(piece.tspin());
         assert_eq!(
             evaluate_move(10, Some(t_piece), &b, &mini, false, &Weights::default()).evaluation,
             -360

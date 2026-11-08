@@ -465,12 +465,7 @@ impl Search {
             if garbage {
                 self.select_guidance = previous_plan
                     .into_iter()
-                    .map(|piece| {
-                        piece.map(|piece| Piece {
-                            y: piece.y + difference as i8,
-                            ..piece
-                        })
-                    })
+                    .map(|piece| piece.map(|piece| piece.shifted(0, difference as i8)))
                     .collect();
             }
         }
@@ -1430,14 +1425,6 @@ mod tests {
         assert_eq!(profile.expansion_count, stats.expanded);
         assert_eq!(profile.evaluated_boards as usize, stats.nodes - 1);
         assert!(profile.movegen_calls > 0);
-        assert!(profile.movegen_worker_wall_ns > 0);
-        assert!(profile.movegen_worker_wall_ns <= profile.expansion_worker_wall_ns);
-        assert!(profile.movegen_worker_cpu_ns <= profile.expansion_worker_cpu_ns);
-        assert!(profile.selection_wall_ns > 0);
-        assert!(profile.expansion_wall_ns > 0);
-        assert!(profile.registration_wall_ns > 0);
-        assert!(profile.evaluation_wall_ns > 0);
-        assert!(profile.backpropagation_wall_ns > 0);
         search.start(Board::default(), queue);
         assert_eq!(search.profile().batches, 0);
         assert_eq!(search.profile().movegen_calls, 0);

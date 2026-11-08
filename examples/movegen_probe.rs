@@ -275,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let mut cells = placement.piece.cells();
                         cells.sort_unstable();
-                        records.push(json!({"cells":cells,"spin":placement.piece.tspin,"time":placement.time,"piece":placement.piece}));
+                        records.push(json!({"cells":cells,"spin":placement.piece.tspin(),"time":placement.time,"piece":placement.piece}));
                     }
                     let mut sorted = records.clone();
                     sorted.sort_by_key(|record| record.to_string());

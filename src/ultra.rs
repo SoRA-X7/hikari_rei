@@ -337,7 +337,7 @@ impl Recording {
             piece.kind as i32 + 1,
             piece.x as i32,
             piece.y as i32,
-            piece.rotation as i32,
+            piece.rotation() as i32,
         ];
         if let Some(&index) = self.pose_ids.get(&value) {
             return index as i64;
@@ -612,7 +612,7 @@ impl Game {
                             current.kind,
                             current.x,
                             current.y - 1,
-                            current.rotation,
+                            current.rotation(),
                         ));
                     }
                 }

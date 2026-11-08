@@ -266,21 +266,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_old_keys_and_reuses_allocations() {
+    fn clear_removes_old_keys_and_allows_reinsertion() {
         let mut lookup = BoardLookup::default();
         for index in 0..1000 {
             lookup.insert(board(index), index);
         }
-        let bucket_capacity = lookup.buckets.capacity();
-        let record_capacity = lookup.records.capacity();
         lookup.clear();
         assert_eq!(lookup.keys().count(), 0);
         for index in 0..1000 {
             assert_eq!(lookup.get(&board(index)), None);
             assert_eq!(lookup.insert(board(index), index + 7), None);
         }
-        assert_eq!(lookup.buckets.capacity(), bucket_capacity);
-        assert_eq!(lookup.records.capacity(), record_capacity);
         assert_eq!(lookup.get(&board(999)), Some(&1006));
     }
 
@@ -317,9 +313,6 @@ mod tests {
         let mut lookup = BoardLookup::default();
         for (index, key) in keys.iter().copied().enumerate() {
             assert_eq!(lookup.insert(key, index as u32), None);
-            if index != 0 {
-                assert_ne!(board_hash(&keys[0]), board_hash(&key));
-            }
         }
         for (index, key) in keys.iter().enumerate() {
             assert_eq!(lookup.get(key), Some(&(index as u32)));

@@ -295,7 +295,7 @@ impl<'a> Mirai<'a> {
     fn record_lock(&mut self, dropped: Piece, current: StepRef) {
         if self
             .deduplicator
-            .insert((dropped.cells(), current.piece.tspin))
+            .insert((dropped.cells(), current.piece.tspin()))
             && self.locked_keys.insert(dropped)
         {
             self.locked.push((dropped, current));
@@ -309,7 +309,7 @@ impl<'a> Mirai<'a> {
             return;
         }
         #[cfg(feature = "prune-low-stack")]
-        if result.tspin == TSpin::None
+        if result.tspin() == TSpin::None
             && self.prune_heights.as_ref().is_some_and(|heights| {
                 result
                     .cells()
@@ -435,7 +435,7 @@ mod tests {
         placements.sort_by_key(|p| p.piece.x);
         let actual: Vec<_> = placements
             .into_iter()
-            .map(|p| (p.piece.x, p.piece.y, p.piece.rotation, p.time))
+            .map(|p| (p.piece.x, p.piece.y, p.piece.rotation(), p.time))
             .collect();
         assert_eq!(
             actual,

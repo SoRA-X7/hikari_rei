@@ -125,9 +125,9 @@ fn center_offset(piece: PieceKind, rotation: u8) -> (i8, i8) {
 }
 
 pub fn to_tbp(piece: Piece) -> Value {
-    let (dx, dy) = center_offset(piece.kind, piece.rotation);
-    json!({"location":{"type":piece.kind,"orientation":(["north","east","south","west"][piece.rotation as usize]),
-        "x":piece.x as i32 + dx as i32,"y":piece.y as i32 + dy as i32},"spin":piece.tspin})
+    let (dx, dy) = center_offset(piece.kind, piece.rotation());
+    json!({"location":{"type":piece.kind,"orientation":(["north","east","south","west"][piece.rotation() as usize]),
+        "x":piece.x as i32 + dx as i32,"y":piece.y as i32 + dy as i32},"spin":piece.tspin()})
 }
 
 pub fn from_tbp(value: &Value) -> Result<Piece, String> {
@@ -160,13 +160,7 @@ pub fn from_tbp(value: &Value) -> Result<Piece, String> {
         "full" => TSpin::Full,
         _ => return Err("invalid spin".into()),
     };
-    Ok(Piece {
-        kind: piece_kind,
-        x: x as i8,
-        y: y as i8,
-        rotation,
-        tspin,
-    })
+    Ok(Piece::new(piece_kind, x as i8, y as i8, rotation).with_tspin(tspin))
 }
 
 enum Action {

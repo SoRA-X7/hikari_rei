@@ -69,12 +69,13 @@ pub enum TSpin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "PieceWire", into = "PieceWire")]
 pub struct Piece {
     pub kind: PieceKind,
     pub x: i8,
     pub y: i8,
-    pub rotation: u8,
-    pub tspin: TSpin,
+    // Low two bits: rotation; next two bits: T-spin classification.
+    state: u8,
 }
 impl Piece {
     pub const fn new(kind: PieceKind, x: i8, y: i8, rotation: u8) -> Self {
@@ -82,8 +83,7 @@ impl Piece {
             kind,
             x,
             y,
-            rotation: rotation & 3,
-            tspin: TSpin::None,
+            state: rotation & 3,
         }
     }
     pub const fn spawn(kind: PieceKind) -> Self {
@@ -103,15 +103,30 @@ impl Piece {
     }
     pub fn with_rotation(self, rotation: u8) -> Self {
         Self {
-            rotation: rotation & 3,
+            state: (self.state & !3) | (rotation & 3),
             ..self
         }
     }
     pub fn with_tspin(self, tspin: TSpin) -> Self {
-        Self { tspin, ..self }
+        Self {
+            state: (self.state & 3) | ((tspin as u8) << 2),
+            ..self
+        }
+    }
+    #[inline]
+    pub const fn rotation(self) -> u8 {
+        self.state & 3
+    }
+    #[inline]
+    pub const fn tspin(self) -> TSpin {
+        match self.state >> 2 {
+            0 => TSpin::None,
+            1 => TSpin::Mini,
+            _ => TSpin::Full,
+        }
     }
     pub fn shape(self) -> [u16; 4] {
-        SHAPES[self.kind as usize][(self.rotation & 3) as usize]
+        SHAPES[self.kind as usize][self.rotation() as usize]
     }
     pub fn cells(self) -> [(i32, i32); 4] {
         let shape = self.shape();
@@ -132,9 +147,35 @@ impl fmt::Display for Piece {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.kind)?;
         if self.kind == PieceKind::T {
-            write!(f, "_{:?}", self.tspin)?;
+            write!(f, "_{:?}", self.tspin())?;
         }
-        write!(f, " ({},{}) {}", self.x, self.y, self.rotation)
+        write!(f, " ({},{}) {}", self.x, self.y, self.rotation())
+    }
+}
+
+// Preserve the public serialized fields while packing their in-memory representation.
+#[derive(Serialize, Deserialize)]
+struct PieceWire {
+    kind: PieceKind,
+    x: i8,
+    y: i8,
+    rotation: u8,
+    tspin: TSpin,
+}
+impl From<PieceWire> for Piece {
+    fn from(p: PieceWire) -> Self {
+        Self::new(p.kind, p.x, p.y, p.rotation).with_tspin(p.tspin)
+    }
+}
+impl From<Piece> for PieceWire {
+    fn from(p: Piece) -> Self {
+        Self {
+            kind: p.kind,
+            x: p.x,
+            y: p.y,
+            rotation: p.rotation(),
+            tspin: p.tspin(),
+        }
     }
 }
 
@@ -229,7 +270,7 @@ impl Board {
                     piece.kind,
                     piece.x,
                     (y + 1) as i8,
-                    piece.rotation,
+                    piece.rotation(),
                 ));
             }
         }
@@ -271,8 +312,8 @@ impl Board {
                 .filter(|(x, y)| self.occupied(*x + piece.x as i32, *y + piece.y as i32))
                 .count()
         };
-        let front = count(piece.rotation as usize);
-        let back = count((piece.rotation as usize + 2) & 3);
+        let front = count(piece.rotation() as usize);
+        let back = count((piece.rotation() as usize + 2) & 3);
         if front + back < 3 {
             TSpin::None
         } else if kick == 4 || back == 2 {
@@ -285,7 +326,7 @@ impl Board {
         if piece.kind == PieceKind::O {
             return Some((piece, 0));
         }
-        let rotation = (piece.rotation + if clockwise { 1 } else { 3 }) & 3;
+        let rotation = (piece.rotation() + if clockwise { 1 } else { 3 }) & 3;
         let direct = Piece::new(piece.kind, piece.x, piece.y, rotation);
         if !self.collides(direct) {
             return Some((direct, 0));
@@ -295,7 +336,7 @@ impl Board {
         } else {
             &KICKS
         };
-        let index = (piece.rotation as usize * 2 + if clockwise { 0 } else { 7 }) & 7;
+        let index = (piece.rotation() as usize * 2 + if clockwise { 0 } else { 7 }) & 7;
         for (kick, &(x, y)) in table[index].iter().enumerate() {
             let result = piece.shifted(x, y).with_rotation(rotation);
             if !self.collides(result) {
@@ -358,7 +399,7 @@ impl Board {
             self.rows[HEIGHT - 1 - index] = 0;
         }
         let perfect_clear = self.rows.iter().all(|row| *row == 0);
-        let placement = (piece.tspin as u8) * 8 + count as u8;
+        let placement = (piece.tspin() as u8) * 8 + count as u8;
         if count != 0 {
             self.ren += 1;
             self.back_to_back = placement >= 4;
@@ -485,7 +526,7 @@ mod tests {
         let grounded = Piece::new(PieceKind::T, 3, -1, 0).with_tspin(TSpin::Full);
         assert_eq!(board.sonic_drop(grounded), Some(grounded));
         assert_eq!(
-            board.sonic_drop(grounded.shifted(0, 1)).unwrap().tspin,
+            board.sonic_drop(grounded.shifted(0, 1)).unwrap().tspin(),
             TSpin::None
         );
     }
