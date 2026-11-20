@@ -9,6 +9,7 @@ pub(super) fn pick_ranked_cached(
     children: &Layer,
     rng: &mut Random,
     scratch: &mut [f32; 255],
+    focus: bool,
 ) -> usize {
     debug_assert!(edges.len() <= scratch.len());
     let weights = &mut scratch[..edges.len()];
@@ -31,7 +32,9 @@ pub(super) fn pick_ranked_cached(
             } else {
                 let distance = *weight - minimum + 1.0;
                 let rank = (rank + 1) as f32;
-                distance * distance / (rank * rank) + 40.0
+                let squared = rank * rank;
+                let denominator = if focus { squared * rank } else { squared };
+                distance * distance / denominator + 40.0
             };
             *weight
         })
@@ -74,7 +77,7 @@ mod tests {
         // Reused storage must not depend on values left by a previous walk.
         let mut scratch = [f32::NAN; 255];
         let expected = pick_ranked(edges, layer, &mut reference);
-        let result = pick_ranked_cached(edges, layer, &mut actual, &mut scratch);
+        let result = pick_ranked_cached(edges, layer, &mut actual, &mut scratch, false);
         assert_eq!(result, expected);
         assert_eq!(actual.0, reference.0, "random consumption changed");
         result
@@ -123,7 +126,7 @@ mod tests {
                 let mut expected = Random::new(seed);
                 let mut actual = Random::new(seed);
                 let reference = pick_ranked(&edges, &layer, &mut expected);
-                let result = pick_ranked_cached(&edges, &layer, &mut actual, &mut scratch);
+                let result = pick_ranked_cached(&edges, &layer, &mut actual, &mut scratch, false);
                 assert_eq!(result, reference, "case {case}, seed {seed}");
                 assert_eq!(actual.0, expected.0, "case {case}, seed {seed}");
             }
@@ -144,7 +147,7 @@ mod tests {
             let before = rng.0;
             let mut scratch = [1.0; 255];
             assert_eq!(
-                pick_ranked_cached(&edges, &layer, &mut rng, &mut scratch),
+                pick_ranked_cached(&edges, &layer, &mut rng, &mut scratch, false),
                 0
             );
             assert_eq!(rng.0, before);

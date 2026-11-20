@@ -119,7 +119,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Tbp { options } => protocol::run_tbp_with_geometric_cavities(
+        Command::Tbp { options } => protocol::run_tbp_with_cubic_root_weights(
             options.tbp_config(),
             Weights {
                 ren: 140,

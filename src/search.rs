@@ -616,6 +616,7 @@ pub struct Search {
     config: Config,
     weights: Weights,
     cavity_mode: CavityMode,
+    cubic_root_weights: bool,
     board: Board,
     queue: Vec<PieceKind>,
     pending: VecDeque<PieceKind>,
@@ -662,6 +663,7 @@ impl Search {
             config,
             weights,
             cavity_mode,
+            cubic_root_weights: false,
             board: Board::default(),
             queue: Vec::new(),
             pending: VecDeque::new(),
@@ -679,6 +681,11 @@ impl Search {
             stream,
             registration: RegistrationScratch::default(),
         })
+    }
+
+    pub(crate) fn with_cubic_root_weights(mut self) -> Self {
+        self.cubic_root_weights = true;
+        self
     }
 
     /// Explicitly replace the position. Ordinary committed moves use commit,
@@ -1178,7 +1185,9 @@ impl Search {
     }
 
     fn select(&self, rng: &mut Random, guided: bool) -> Option<Selected> {
-        self.select_using(rng, guided, pick_ranked)
+        self.select_using(rng, guided, |edges, children, rng, _| {
+            pick_ranked(edges, children, rng)
+        })
     }
 
     fn select_cached(
@@ -1187,8 +1196,9 @@ impl Search {
         guided: bool,
         scratch: &mut [f32; 255],
     ) -> Option<Selected> {
-        self.select_using(rng, guided, |edges, children, rng| {
-            selection::pick_ranked_cached(edges, children, rng, scratch)
+        self.select_using(rng, guided, |edges, children, rng, depth| {
+            let focus = depth == 0 && self.cubic_root_weights;
+            selection::pick_ranked_cached(edges, children, rng, scratch, focus)
         })
     }
 
@@ -1196,7 +1206,7 @@ impl Search {
         &self,
         rng: &mut Random,
         guided: bool,
-        mut pick: impl FnMut(&[Edge], &Layer, &mut Random) -> usize,
+        mut pick: impl FnMut(&[Edge], &Layer, &mut Random, usize) -> usize,
     ) -> Option<Selected> {
         let mut board = self.board;
         let mut index = self.root;
@@ -1239,7 +1249,7 @@ impl Search {
             } else {
                 None
             }
-            .unwrap_or_else(|| pick(edges, child_layer, rng));
+            .unwrap_or_else(|| pick(edges, child_layer, rng, depth));
             let child = edges.get(picked)?;
             // Keep original semantics: draw consumption happens on the path,
             // not in the dedup/evaluation key produced by ExpandJob.
