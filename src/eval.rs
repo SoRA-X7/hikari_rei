@@ -399,7 +399,7 @@ pub(crate) fn evaluate_board_with_cavities(
         }
     }
 
-    let (well, depth) = hole_position(&clone, &heights);
+    let (well, depth) = hole_position(&clone, &heights, cavity_mode);
     let (bump, bump_sq) = bumpiness(&heights, well);
     safety += bump * w.bump_sum + bump_sq * w.bump_sum_sq;
     power += depth * w.hole_depth;
@@ -544,15 +544,21 @@ fn center_height_excess(board: &Board) -> i32 {
         .map_or(0, |row| row as i32 + 1)
 }
 
-fn hole_position(board: &Board, heights: &[i32; 10]) -> (usize, i32) {
+fn hole_position(board: &Board, heights: &Int10, cavity_mode: CavityMode) -> (usize, i32) {
     let mut hole = 0;
     for x in 1..10 {
         if heights[x] <= heights[hole] {
             hole = x;
         }
     }
+    let top = heights[hole];
+    let start = match cavity_mode {
+        CavityMode::Reference => top,
+        // Occupied tops are zero-based. Empty columns still start at row zero.
+        CavityMode::Geometric => top + i32::from(board.occupied(hole as i32, top)),
+    };
     let mut depth = 0;
-    for y in heights[hole]..24 {
+    for y in start..board.rows.len() as i32 {
         if board.rows[y as usize].count_ones() == 9 && !board.occupied(hole as i32, y) {
             depth += 1;
         } else {
@@ -756,6 +762,32 @@ mod tests {
             }
             board.rows[y] = 0;
         }
+    }
+
+    #[test]
+    fn geometric_well_counts_open_rows_above_an_occupied_base() {
+        let mut b = board();
+        let well = 3;
+        b.rows[0] = 0x3ff ^ (1 << 1);
+        b.rows[1] = 0x3ff ^ (1 << well);
+        b.rows[2] = b.rows[1];
+        let (_, heights) = columns(&b);
+
+        assert_eq!(
+            hole_position(&b, &heights, CavityMode::Reference),
+            (well, 0)
+        );
+        assert_eq!(
+            hole_position(&b, &heights, CavityMode::Geometric),
+            (well, 2)
+        );
+
+        b.rows[0] = b.rows[1];
+        let (_, heights) = columns(&b);
+        assert_eq!(
+            hole_position(&b, &heights, CavityMode::Geometric),
+            (well, 3)
+        );
     }
 
     #[test]
