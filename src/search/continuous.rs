@@ -59,17 +59,31 @@ impl Stream {
 }
 
 pub(super) fn prepare(selected: Selected, use_hold: bool, weights: &Weights) -> Expansion {
-    let mut expansion = make_expansion(selected, use_hold, weights);
+    let mut held_copies = Vec::new();
+    let mut expansion =
+        make_expansion_with_held_copies(selected, use_hold, weights, |first, start, count| {
+            held_copies.push((first, start, count));
+        });
     #[cfg(feature = "profile-search")]
     let clock = ProfileClock::start();
     if !expansion.dead {
-        expansion.evaluations = Some(
-            expansion
-                .edges
-                .iter()
-                .map(|edge| evaluate_board(&edge.board, weights))
-                .collect(),
-        );
+        let evaluate = |edge: &PlannedEdge| evaluate_board(&edge.board, weights);
+        let edges = &expansion.edges;
+        if held_copies.is_empty() {
+            expansion.evaluations = Some(edges.iter().map(evaluate).collect());
+        } else {
+            let mut evaluations = Vec::with_capacity(edges.len());
+            let mut start = 0;
+            for (source, target, count) in held_copies {
+                evaluations.extend(edges[start..target].iter().map(evaluate));
+                // Board evaluation only uses hold to count whether T is available.
+                // Both ranges contain matching geometry and non-T hold pieces.
+                evaluations.extend_from_within(source..source + count);
+                start = target + count;
+            }
+            evaluations.extend(edges[start..].iter().map(evaluate));
+            expansion.evaluations = Some(evaluations);
+        }
     }
     #[cfg(feature = "profile-search")]
     {

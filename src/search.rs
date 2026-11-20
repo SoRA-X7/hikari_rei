@@ -541,6 +541,7 @@ struct Selected {
     candidates: u8,
 }
 
+#[derive(Clone, Copy)]
 struct PlannedEdge {
     // Intentionally before bag.Take(current): original ExpandJob keys and
     // evaluates this board. Selection reconstructs the consumed bag separately.
@@ -1511,6 +1512,15 @@ fn apply_transition(board: &mut Board, current: PieceKind, piece: Option<Piece>)
 }
 
 fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expansion {
+    make_expansion_with_held_copies(selected, use_hold, weights, |_, _, _| {})
+}
+
+fn make_expansion_with_held_copies(
+    selected: Selected,
+    use_hold: bool,
+    weights: &Weights,
+    mut held_copy: impl FnMut(usize, usize, usize),
+) -> Expansion {
     #[cfg(feature = "profile-search")]
     let clock = ProfileClock::start();
     let mut output = Expansion {
@@ -1525,6 +1535,12 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
     // Mirai caches movements for both current and held piece in one instance.
     // Here each distinct kind is generated once and shared among draw cases.
     let mut moves: [Option<Vec<movegen::Placement>>; 7] = std::array::from_fn(|_| None);
+    let reuse_held = use_hold
+        && selected.can_hold
+        && selected.board.hold.is_some_and(|held| {
+            (selected.candidates & !(1 << held as u8 | 1 << PieceKind::T as u8)).count_ones() > 1
+        });
+    let mut held_range: Option<(usize, usize)> = None;
     for kind in KINDS {
         if selected.candidates & (1 << kind as u8) == 0 {
             continue;
@@ -1543,18 +1559,43 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
         if use_hold && selected.can_hold {
             if let Some(held) = selected.board.hold {
                 if held != kind {
-                    let mut after_hold = selected.board;
-                    after_hold.hold = Some(kind);
-                    append_placements(
-                        &mut output.edges,
-                        after_hold,
-                        held,
-                        true,
-                        weights,
-                        &mut moves,
-                        #[cfg(feature = "profile-search")]
-                        &mut output.profile,
-                    );
+                    // The lock result and move reward are independent of the
+                    // new hold piece except for the evaluator's held-T bonus.
+                    if let Some((first, end)) = held_range.filter(|_| kind != PieceKind::T) {
+                        let copy_start = output.edges.len();
+                        let copied = (end - first).min(255usize.saturating_sub(copy_start - start));
+                        if copied != 0 {
+                            held_copy(first, copy_start, copied);
+                        }
+                        for index in first..first + copied {
+                            let mut edge = output.edges[index];
+                            edge.board.hold = Some(kind);
+                            #[cfg(feature = "fast-registration")]
+                            {
+                                edge.hash = board_hash(&edge.board);
+                            }
+                            output.edges.push(edge);
+                        }
+                    } else {
+                        let mut after_hold = selected.board;
+                        after_hold.hold = Some(kind);
+                        let first = output.edges.len();
+                        append_placements(
+                            &mut output.edges,
+                            after_hold,
+                            held,
+                            true,
+                            weights,
+                            &mut moves,
+                            #[cfg(feature = "profile-search")]
+                            &mut output.profile,
+                        );
+                        let end = output.edges.len();
+                        // Reuse only a complete range that survives truncation.
+                        if reuse_held && kind != PieceKind::T && end - start <= 255 {
+                            held_range = Some((first, end));
+                        }
+                    }
                 }
             } else {
                 let mut board = selected.board;
@@ -2168,6 +2209,91 @@ mod tests {
         let held_parent = layer.parents[layer.nodes[held as usize].parent_head as usize];
         assert_eq!(held_parent.parent, 22);
         assert_eq!(held_parent.next, NONE);
+    }
+
+    #[test]
+    fn shared_hold_expansion_matches_individual_draws_in_order() {
+        let weights = Weights {
+            hold_t: 73,
+            ..Weights::default()
+        };
+        let masks = [
+            127,
+            (1 << PieceKind::I as u8) | (1 << PieceKind::T as u8) | (1 << PieceKind::S as u8),
+            (1 << PieceKind::O as u8) | (1 << PieceKind::S as u8),
+        ];
+        for hold in [None, Some(PieceKind::I), Some(PieceKind::T)] {
+            for height in [0, 1, 9, 21] {
+                let mut board = Board {
+                    hold,
+                    ren: 4,
+                    back_to_back: true,
+                    ..Board::default()
+                };
+                for row in &mut board.rows[..height] {
+                    *row = 1023 ^ 0xf;
+                }
+                for candidates in masks {
+                    let selected = Selected {
+                        depth: 6,
+                        node: 0,
+                        board,
+                        can_hold: true,
+                        candidates,
+                    };
+                    let planned = make_expansion(selected, true, &weights);
+                    if !planned.dead {
+                        let prepared = continuous::prepare(selected, true, &weights);
+                        let expected: Vec<_> = planned
+                            .edges
+                            .iter()
+                            .map(|edge| evaluate_board(&edge.board, &weights))
+                            .collect();
+                        assert_eq!(prepared.evaluations, Some(expected));
+                    }
+                    let mut offset = 0;
+                    let mut lengths = [0; 7];
+                    let mut dead = false;
+                    for kind in KINDS {
+                        let bit = 1 << kind as u8;
+                        if candidates & bit == 0 {
+                            continue;
+                        }
+                        let individual = make_expansion(
+                            Selected {
+                                candidates: bit,
+                                ..selected
+                            },
+                            true,
+                            &weights,
+                        );
+                        lengths[kind as usize] = individual.lengths[kind as usize];
+                        for expected in individual.edges {
+                            let edge = &planned.edges[offset];
+                            assert_eq!(
+                                (edge.board, edge.piece, edge.reward, edge.time),
+                                (
+                                    expected.board,
+                                    expected.piece,
+                                    expected.reward,
+                                    expected.time
+                                )
+                            );
+                            #[cfg(feature = "fast-registration")]
+                            assert_eq!(edge.hash, expected.hash);
+                            offset += 1;
+                        }
+                        if individual.dead {
+                            dead = true;
+                            break;
+                        }
+                    }
+                    assert_eq!(planned.lengths, lengths);
+                    assert_eq!(planned.dead, dead);
+                    assert_eq!(planned.edges.len(), offset);
+                }
+            }
+        }
     }
 
     #[test]
