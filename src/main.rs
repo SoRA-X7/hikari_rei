@@ -25,9 +25,9 @@ struct Options {
     threads: usize,
     #[arg(long, default_value_t = 32)]
     max_depth: usize,
-    /// Stop adding nodes at this bound; keep the existing DAG.
-    #[arg(long, default_value_t = 2_000_000)]
-    max_nodes: usize,
+    /// Stop growing the DAG at this bound (3,500,000 for TBP; 2,000,000 otherwise).
+    #[arg(long)]
+    max_nodes: Option<usize>,
     #[arg(long, default_value_t = 1)]
     seed: u64,
     #[arg(long)]
@@ -46,11 +46,18 @@ impl Options {
         Config {
             threads: self.threads,
             max_depth: self.max_depth,
-            max_nodes: self.max_nodes,
+            max_nodes: self.max_nodes.unwrap_or(defaults.max_nodes),
             seed: self.seed,
             use_hold: !self.no_hold,
             use_speculation: !self.no_speculation,
             ..defaults
+        }
+    }
+
+    fn tbp_config(&self) -> Config {
+        Config {
+            max_nodes: self.max_nodes.unwrap_or(3_500_000),
+            ..self.config()
         }
     }
 }
@@ -113,7 +120,7 @@ fn main() {
 fn run() -> Result<(), String> {
     match Cli::parse().command {
         Command::Tbp { options } => protocol::run_tbp_with_cap_reclamation(
-            options.config(),
+            options.tbp_config(),
             Weights {
                 ren: 140,
                 b2b_destroy: -250,
@@ -326,6 +333,20 @@ mod tests {
         assert_eq!(config.seed, 19);
         assert!(!config.use_hold);
         assert!(!config.use_speculation);
+    }
+
+    #[test]
+    fn tbp_node_limit_defaults_higher_and_respects_explicit_overrides() {
+        for (args, expected) in [
+            (&["hikari_rei", "tbp"][..], 3_500_000),
+            (&["hikari_rei", "tbp", "--max-nodes", "10000"][..], 10_000),
+        ] {
+            let Command::Tbp { options } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected tbp command");
+            };
+            assert_eq!(options.tbp_config().max_nodes, expected);
+        }
+        assert_eq!(bench_config(&["hikari_rei", "bench"]).max_nodes, 2_000_000);
     }
 
     #[test]
