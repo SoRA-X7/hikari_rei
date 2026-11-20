@@ -470,8 +470,9 @@ pub fn evaluate_move(
             time += 40;
         }
         evaluation += time * w.move_time;
-        let danger_height = max_height(board, 0b0001111000);
-        evaluation += (danger_height - 15).max(0) * time * w.danger;
+        if w.danger != 0 {
+            evaluation += center_height_excess(board) * time * w.danger;
+        }
         if line_clear && placement.back_to_back {
             evaluation += w.b2b_continue;
         }
@@ -533,6 +534,14 @@ fn max_height(board: &Board, filter: u16) -> i32 {
         .iter()
         .rposition(|row| row & filter != 0)
         .unwrap_or(0) as i32
+}
+
+fn center_height_excess(board: &Board) -> i32 {
+    // Row 15 and everything below it have no danger penalty.
+    board.rows[16..]
+        .iter()
+        .rposition(|row| row & 0b0001111000 != 0)
+        .map_or(0, |row| row as i32 + 1)
 }
 
 fn hole_position(board: &Board, heights: &[i32; 10]) -> (usize, i32) {
@@ -732,6 +741,20 @@ mod tests {
             hold: None,
             bag: 0x7f,
             ren: 0,
+        }
+    }
+
+    #[test]
+    fn center_danger_matches_reference_across_board_rows() {
+        let mut board = board();
+        assert_eq!(center_height_excess(&board), 0);
+        for y in 0..board.rows.len() {
+            for x in 0..10 {
+                board.rows[y] = 1 << x;
+                let expected = (max_height(&board, 0b0001111000) - 15).max(0);
+                assert_eq!(center_height_excess(&board), expected, "({x}, {y})");
+            }
+            board.rows[y] = 0;
         }
     }
 
