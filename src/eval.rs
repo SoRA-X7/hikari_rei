@@ -406,7 +406,7 @@ pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
     safety += (max_height - 10).max(0) * w.top50;
     safety += (max_height - 15).max(0) * w.top75;
 
-    let (cavities, overhangs) = cavities_and_overhangs(&clone, &columns, max_height);
+    let (cavities, overhangs) = cavities_and_overhangs(&columns, max_height);
     safety += cavities * w.cavities + cavities * cavities * w.cavities_sq;
     safety += overhangs * w.overhangs + overhangs * overhangs * w.overhangs_sq;
     let (covered, covered_sq) = covered_cells(&clone, &heights);
@@ -559,26 +559,29 @@ fn covered_cells(board: &Board, heights: &[i32; 10]) -> (i32, i32) {
     (count, sq)
 }
 
-fn cavities_and_overhangs(board: &Board, columns: &[i32; 10], height: i32) -> (i32, i32) {
-    let mut cavities = 0;
+fn cavities_and_overhangs(columns: &[i32; 10], height: i32) -> (i32, i32) {
+    let height = height.max(0);
+    let mut empty_cells = 0;
     let mut overhangs = 0;
-    for y in 0..height {
-        for x in 0..10 {
-            if y >= columns[x] || board.occupied(x as i32, y) {
-                continue;
-            }
-            if x >= 2 && columns[x - 1] < y && columns[x - 2] <= y {
-                overhangs += 1;
-                continue;
-            }
-            if x < 8 && columns[x + 1] < y && columns[x + 2] <= y {
-                overhangs += 1;
-                continue;
-            }
-            cavities += 1;
-        }
+    for (x, &column) in columns.iter().enumerate() {
+        // The reference compares row indices against whole column masks.
+        let limit = height.min(column);
+        let empty = ((1u32 << limit) - 1) & !(column as u32);
+        let left = if x >= 2 {
+            (columns[x - 1] + 1).max(columns[x - 2])
+        } else {
+            height
+        };
+        let right = if x < 8 {
+            (columns[x + 1] + 1).max(columns[x + 2])
+        } else {
+            height
+        };
+        let overhang_start = height.min(left).min(right);
+        empty_cells += empty.count_ones() as i32;
+        overhangs += (empty >> overhang_start).count_ones() as i32;
     }
-    (cavities, overhangs)
+    (empty_cells - overhangs, overhangs)
 }
 
 fn shape_collides(board: &Board, shape: [u8; 4], x: i32, y: i32) -> bool {
@@ -745,7 +748,43 @@ mod tests {
         );
         b.rows[0] = (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6);
         let (bits, _) = columns(&b);
-        assert_eq!(cavities_and_overhangs(&b, &bits, 2), (2, 0));
+        assert_eq!(cavities_and_overhangs(&bits, 2), (2, 0));
+    }
+
+    #[test]
+    fn column_masks_match_row_wise_cavity_classification() {
+        let mut state = 0x5746_8b39_u32;
+        for height in 0..24 {
+            for density in [1, 2, 3] {
+                let mut board = Board::default();
+                for row in &mut board.rows[..=height] {
+                    *row = 1023;
+                    for _ in 0..density {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        *row &= (state >> 16) as u16;
+                    }
+                }
+                let (columns, _) = columns(&board);
+                for limit in [-1, height as i32 / 2, height as i32] {
+                    let mut expected = (0, 0);
+                    for y in 0..limit {
+                        for x in 0..10 {
+                            if y >= columns[x] || board.occupied(x as i32, y) {
+                                continue;
+                            }
+                            if (x >= 2 && columns[x - 1] < y && columns[x - 2] <= y)
+                                || (x < 8 && columns[x + 1] < y && columns[x + 2] <= y)
+                            {
+                                expected.1 += 1;
+                            } else {
+                                expected.0 += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(cavities_and_overhangs(&columns, limit), expected);
+                }
+            }
+        }
     }
 
     #[test]
