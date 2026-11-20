@@ -183,18 +183,22 @@ impl<'a> Mirai<'a> {
         }
     }
     fn generate(&mut self, spawned: Piece) {
+        self.generate_until(spawned, |_| false);
+    }
+
+    fn generate_until(&mut self, spawned: Piece, stop_after: impl Fn(Piece) -> bool) {
         #[cfg(feature = "prune-low-stack")]
         {
             self.prune_heights = None;
         }
         #[cfg(feature = "fast-low-stack")]
         if self.board.max_height() < 16 && spawned == Piece::spawn(spawned.kind) {
-            self.generate_low_stack(spawned.kind);
+            self.generate_low_stack(spawned.kind, stop_after);
             return;
         }
-        self.generate_full(spawned);
+        self.generate_full(spawned, stop_after);
     }
-    fn generate_full(&mut self, spawned: Piece) {
+    fn generate_full(&mut self, spawned: Piece, stop_after: impl Fn(Piece) -> bool) {
         if self.tree.contains_key(&spawned) {
             return;
         }
@@ -211,10 +215,10 @@ impl<'a> Mirai<'a> {
             piece: spawned,
             cost: 0,
         });
-        self.drain_queue(spawned.kind);
+        self.drain_queue(spawned.kind, stop_after);
     }
     #[cfg(feature = "fast-low-stack")]
-    fn generate_low_stack(&mut self, kind: PieceKind) {
+    fn generate_low_stack(&mut self, kind: PieceKind, stop_after: impl Fn(Piece) -> bool) {
         if self.tree.contains_key(&Piece::spawn(kind)) {
             return;
         }
@@ -236,7 +240,11 @@ impl<'a> Mirai<'a> {
             if origin.depth < MAX_INSTRUCTIONS && dropped.y != current.piece.y {
                 self.append(origin, Some(dropped), Instruction::SonicDrop, true);
             }
+            let previous_locks = self.locked.len();
             self.record_lock(dropped, current);
+            if stop_after(dropped) && self.locked.len() > previous_locks {
+                return;
+            }
         }
         // Cached-only mode retains the full stack exploration, although
         // seeding can change first-discovery ties and placement order.
@@ -255,9 +263,9 @@ impl<'a> Mirai<'a> {
                     .map_or(0, |y| (y + 1) as u8)
             }));
         }
-        self.drain_queue(kind);
+        self.drain_queue(kind, stop_after);
     }
-    fn drain_queue(&mut self, kind: PieceKind) {
+    fn drain_queue(&mut self, kind: PieceKind, stop_after: impl Fn(Piece) -> bool) {
         while let Some(current) = self.next.pop() {
             let piece = current.piece;
             let origin = self.tree[&piece];
@@ -270,7 +278,11 @@ impl<'a> Mirai<'a> {
                     self.append(origin, Some(dropped), Instruction::SonicDrop, true);
                 }
             }
+            let previous_locks = self.locked.len();
             self.record_lock(dropped, current);
+            if stop_after(dropped) && self.locked.len() > previous_locks {
+                return;
+            }
         }
     }
     fn append_air_moves(&mut self, origin: Step, kind: PieceKind) {
@@ -385,7 +397,9 @@ pub mod path {
     pub fn find_path(board: &Board, piece: Piece, hold: bool) -> Option<Path> {
         let spawned = board.spawn(piece.kind)?;
         let mut mirai = Mirai::new(board);
-        mirai.generate(spawned);
+        // A geometrically equivalent lock can shadow the requested rotation.
+        // Stop only after the exact piece has been accepted by both deduplicators.
+        mirai.generate_until(spawned, |locked| locked == piece);
         mirai.rebuild(piece, hold)
     }
 }
@@ -427,6 +441,54 @@ mod tests {
         assert_eq!(path.time, time);
         assert!(target.kind == PieceKind::T || time < 20);
     }
+    #[test]
+    fn targeted_path_search_matches_exhaustive_paths() {
+        for height in [0, 4, 10, 15, 16, 19] {
+            let mut board = Board::default();
+            for (y, row) in board.rows[..height].iter_mut().enumerate() {
+                *row = if y % 3 == 0 {
+                    0b1100111011
+                } else {
+                    0b1000111001
+                };
+            }
+            for kind in PieceKind::ALL {
+                let Some(spawned) = board.spawn(kind) else {
+                    continue;
+                };
+                let mut original = Mirai::new(&board);
+                original.generate(spawned);
+                for &(piece, _) in &original.locked {
+                    assert_eq!(
+                        find_path(&board, piece, true),
+                        original.rebuild(piece, true)
+                    );
+                }
+                assert_eq!(find_path(&board, Piece::new(kind, 3, 24, 0), false), None);
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_search_stops_at_accepted_lock_and_skips_shadowed_rotation() {
+        let board = Board::default();
+        let spawn = Piece::spawn(PieceKind::I);
+        let canonical = Piece::new(PieceKind::I, 3, -2, 0);
+        let shadowed = Piece::new(PieceKind::I, 3, -1, 2);
+        assert_eq!(canonical.cells(), shadowed.cells());
+
+        let mut early = Mirai::new(&board);
+        early.generate_until(spawn, |piece| piece == canonical);
+        assert_eq!(early.locked.len(), 1);
+        assert_eq!(early.locked[0].0, canonical);
+        assert_eq!(find_path(&board, canonical, false).unwrap().time, 0);
+        assert_eq!(find_path(&board, shadowed, false), None);
+        assert_eq!(
+            find_path(&board, canonical.with_tspin(TSpin::Full), false),
+            None
+        );
+    }
+
     #[test]
     fn original_mirai_generate_empty_o_golden() {
         // Exact fixture from Assets/AI/Tests/MiraiTests.cs GenerateEmptyO.
@@ -536,7 +598,7 @@ mod tests {
         for kind in PieceKind::ALL {
             let spawned = board.spawn(kind).unwrap();
             let mut full = Mirai::new(&board);
-            full.generate_full(spawned);
+            full.generate_full(spawned, |_| false);
             let mut fallback = Mirai::new(&board);
             fallback.generate(spawned);
             let placements = |mirai: &Mirai<'_>| {
