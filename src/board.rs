@@ -125,7 +125,7 @@ impl Piece {
             _ => TSpin::Full,
         }
     }
-    pub fn shape(self) -> [u16; 4] {
+    pub const fn shape(self) -> [u16; 4] {
         SHAPES[self.kind as usize][self.rotation() as usize]
     }
     pub fn cells(self) -> [(i32, i32); 4] {
