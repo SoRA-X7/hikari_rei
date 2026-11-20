@@ -115,6 +115,7 @@ fn run() -> Result<(), String> {
         Command::Tbp { options } => protocol::run_tbp(
             options.config(),
             Weights {
+                clear4: 1000,
                 ren: 140,
                 b2b_destroy: -250,
                 ..Weights::default()
