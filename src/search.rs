@@ -25,6 +25,7 @@ use crate::movegen;
 
 mod continuous;
 mod dirty;
+mod reclaim;
 mod selection;
 
 const NONE: u32 = u32::MAX;

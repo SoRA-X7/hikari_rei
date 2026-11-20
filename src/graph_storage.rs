@@ -126,6 +126,34 @@ impl BoardLookup {
         }
     }
 
+    /// Keep records backed by a retained graph node and remap their IDs.
+    /// The old-to-new map uses `u32::MAX` for a removed node.
+    pub(crate) fn remap_nodes(&mut self, remap: &[u32]) {
+        let mut retained = 0;
+        for old in 0..self.records.len() {
+            let node = remap[self.records[old].node as usize];
+            if node == u32::MAX {
+                continue;
+            }
+            if old != retained {
+                self.records[retained] = self.records[old];
+                self.hashes[retained] = self.hashes[old];
+            }
+            self.records[retained].node = node;
+            retained += 1;
+        }
+        if retained < self.records.len() {
+            self.records.truncate(retained);
+            self.hashes.truncate(retained);
+            self.control.fill(EMPTY);
+            for index in 0..retained {
+                let hash = self.hashes[index];
+                let bucket = self.first_empty(hash);
+                self.set_bucket(bucket, hash, index as u32 + 1);
+            }
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.control.fill(EMPTY);
         self.records.clear();

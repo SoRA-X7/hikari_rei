@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn kind(value: &Value) -> Result<PieceKind, String> {
     value.as_str().ok_or("piece must be a letter")?.parse()
@@ -215,7 +215,18 @@ fn snapshot(search: &Search, position_id: u64, cache: &mut SnapshotCache) -> Val
         "board":search.board(),"queue":search.queue()})
 }
 
-fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search: Search) {
+fn worker(
+    rx: mpsc::Receiver<Request>,
+    published: Arc<RwLock<Value>>,
+    mut search: Search,
+    reclaim_at_cap: bool,
+) {
+    // A TBP peer can ask for another suggestion at any time. Restrict
+    // reclamation to the brief window after a confirmed line-clear play and
+    // before its next suggestion request, without assuming an arena timer.
+    const AFTER_CLEAR_WINDOW: Duration = Duration::from_millis(150);
+    let mut last_reclaim_epoch = None;
+    let mut last_clear = None;
     let mut running = false;
     let mut position_id = 0;
     let mut cache = SnapshotCache::default();
@@ -238,6 +249,7 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
         if let Some(request) = request {
             let result = match request.action {
                 Action::Start(board, queue, id) => {
+                    last_clear = None;
                     search.start(board, queue);
                     position_id = id;
                     running = true;
@@ -255,22 +267,30 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
                     Ok(())
                 }
                 Action::Play(piece, id) => (|| {
+                    let play_started = Instant::now();
+                    last_clear = None;
                     let active = *search.queue().first().ok_or("play before start")?;
                     if find_path(search.board(), piece, piece.kind != active).is_none() {
                         return Err("play is not a reachable Hikari placement".into());
                     }
                     search.commit_physical(piece)?;
+                    last_clear = (search.board().ren > 0).then_some(play_started);
                     position_id = id;
                     Ok(())
                 })(),
                 Action::Reset(board, id) => {
+                    last_clear = None;
                     search.reset(board);
                     position_id = id;
                     Ok(())
                 }
                 Action::Reveal(piece) => search.add_next_piece(piece),
-                Action::Publish => Ok(()),
+                Action::Publish => {
+                    last_clear = None;
+                    Ok(())
+                }
                 Action::Stop => {
+                    last_clear = None;
                     running = false;
                     search.pause();
                     Ok(())
@@ -286,6 +306,12 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
         } else {
             let expanded = search.search_step();
             if expanded == 0 {
+                if reclaim_at_cap
+                    && last_clear.is_some_and(|clear| clear.elapsed() < AFTER_CLEAR_WINDOW)
+                    && search.reclaim_at_cap(&mut last_reclaim_epoch)
+                {
+                    continue;
+                }
                 // At the configured depth/memory bound, block briefly on input
                 // instead of burning a core repeatedly publishing the same tree.
                 match rx.recv_timeout(Duration::from_millis(2)) {
@@ -302,15 +328,25 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
 }
 
 pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
-    run(config, weights, CavityMode::Reference)
+    run(config, weights, CavityMode::Reference, false)
 }
 
 /// Run TBP using physical column tops when classifying cavities and overhangs.
 pub fn run_tbp_with_geometric_cavities(config: Config, weights: Weights) -> Result<(), String> {
-    run(config, weights, CavityMode::Geometric)
+    run(config, weights, CavityMode::Geometric, false)
 }
 
-fn run(config: Config, weights: Weights, cavity_mode: CavityMode) -> Result<(), String> {
+/// Run geometric TBP with post-clear reclamation of unreachable graph nodes.
+pub fn run_tbp_with_cap_reclamation(config: Config, weights: Weights) -> Result<(), String> {
+    run(config, weights, CavityMode::Geometric, true)
+}
+
+fn run(
+    config: Config,
+    weights: Weights,
+    cavity_mode: CavityMode,
+    reclaim_at_cap: bool,
+) -> Result<(), String> {
     let info = json!({"type":"info","name":"Hikari Rust","version":env!("CARGO_PKG_VERSION"),"author":"SoRA_X7",
         "features":["randomizer","move_info"],"reference_commit":crate::REFERENCE_COMMIT,"config":config});
     let search = Search::with_cavity_mode(config, weights, cavity_mode)?;
@@ -319,7 +355,7 @@ fn run(config: Config, weights: Weights, cavity_mode: CavityMode) -> Result<(), 
     ));
     let shared = published.clone();
     let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || worker(rx, shared, search));
+    let handle = thread::spawn(move || worker(rx, shared, search, reclaim_at_cap));
     let result = (|| {
         let mut output = io::BufWriter::new(io::stdout().lock());
         send(&mut output, &info)?;
