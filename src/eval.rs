@@ -353,7 +353,21 @@ pub struct TSpinHole {
     pub rotation: u8,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CavityMode {
+    Reference,
+    Geometric,
+}
+
 pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
+    evaluate_board_with_cavities(board, w, CavityMode::Reference)
+}
+
+pub(crate) fn evaluate_board_with_cavities(
+    board: &Board,
+    w: &Weights,
+    cavity_mode: CavityMode,
+) -> Value {
     let mut clone = *board;
     let mut safety = 0;
     let mut power = 0;
@@ -408,7 +422,12 @@ pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
     safety += (max_height - 10).max(0) * w.top50;
     safety += (max_height - 15).max(0) * w.top75;
 
-    let (cavities, overhangs) = cavities_and_overhangs(&columns, max_height);
+    let thresholds = match cavity_mode {
+        // The reference compares row indices against whole column masks.
+        CavityMode::Reference => columns,
+        CavityMode::Geometric => geometric_tops(&columns, &heights),
+    };
+    let (cavities, overhangs) = cavities_and_overhangs(&columns, &thresholds, max_height);
     safety += cavities * w.cavities + cavities * cavities * w.cavities_sq;
     safety += overhangs * w.overhangs + overhangs * overhangs * w.overhangs_sq;
     if w.covered_cells != 0 || w.covered_cells_sq != 0 {
@@ -565,21 +584,25 @@ fn covered_cells(board: &Board, heights: &[i32; 10]) -> (i32, i32) {
     (count, sq)
 }
 
-fn cavities_and_overhangs(columns: &[i32; 10], height: i32) -> (i32, i32) {
+fn geometric_tops(columns: &Int10, heights: &Int10) -> Int10 {
+    // Row zero can contain a block. Track an empty column below that row.
+    std::array::from_fn(|x| if columns[x] == 0 { -1 } else { heights[x] })
+}
+
+fn cavities_and_overhangs(columns: &Int10, thresholds: &Int10, height: i32) -> (i32, i32) {
     let height = height.max(0);
     let mut empty_cells = 0;
     let mut overhangs = 0;
     for (x, &column) in columns.iter().enumerate() {
-        // The reference compares row indices against whole column masks.
-        let limit = height.min(column);
+        let limit = height.min(thresholds[x]).max(0);
         let empty = ((1u32 << limit) - 1) & !(column as u32);
         let left = if x >= 2 {
-            (columns[x - 1] + 1).max(columns[x - 2])
+            (thresholds[x - 1] + 1).max(thresholds[x - 2])
         } else {
             height
         };
         let right = if x < 8 {
-            (columns[x + 1] + 1).max(columns[x + 2])
+            (thresholds[x + 1] + 1).max(thresholds[x + 2])
         } else {
             height
         };
@@ -754,7 +777,29 @@ mod tests {
         );
         b.rows[0] = (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6);
         let (bits, _) = columns(&b);
-        assert_eq!(cavities_and_overhangs(&bits, 2), (2, 0));
+        assert_eq!(cavities_and_overhangs(&bits, &bits, 2), (2, 0));
+    }
+
+    #[test]
+    fn geometric_cavities_use_column_tops_and_physical_occupancy() {
+        let mut b = board();
+        b.rows[0] = 1 << 6;
+        b.rows[1] = 1 << 6;
+        b.rows[3] = 1 << 4;
+        let (bits, heights) = columns(&b);
+        let thresholds = geometric_tops(&bits, &heights);
+        assert_eq!(cavities_and_overhangs(&bits, &bits, 3), (1, 3));
+        assert_eq!(cavities_and_overhangs(&bits, &thresholds, 3), (0, 3));
+
+        b.rows[0] |= 1 << 5;
+        let (bits, heights) = columns(&b);
+        let thresholds = geometric_tops(&bits, &heights);
+        assert_eq!(cavities_and_overhangs(&bits, &thresholds, 3), (0, 3));
+
+        b.rows[0] |= 1 << 3;
+        let (bits, heights) = columns(&b);
+        let thresholds = geometric_tops(&bits, &heights);
+        assert_eq!(cavities_and_overhangs(&bits, &thresholds, 3), (1, 2));
     }
 
     #[test]
@@ -787,7 +832,7 @@ mod tests {
                             }
                         }
                     }
-                    assert_eq!(cavities_and_overhangs(&columns, limit), expected);
+                    assert_eq!(cavities_and_overhangs(&columns, &columns, limit), expected);
                 }
             }
         }
