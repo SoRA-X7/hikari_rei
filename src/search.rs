@@ -806,7 +806,14 @@ impl Search {
                 updates[depth].push(index as u32);
             }
         }
-        self.propagate(updates);
+        // Seeds have already changed their draw mask or dead flag. Propagate
+        // every seed to its parents, then stop at unchanged ancestor values.
+        dirty::propagate_changed_with_scratch(
+            self.layers.make_contiguous(),
+            &mut updates,
+            self.pool.as_ref(),
+            &mut self.stream.dirty,
+        );
     }
 
     /// A batch takes independent random walks through the current graph,
@@ -1250,6 +1257,7 @@ impl Search {
         None
     }
 
+    #[cfg(test)]
     fn propagate(&mut self, mut updates: Vec<Vec<u32>>) {
         // VecDeque's backing storage may wrap after an advance. Using separate
         // slices here keeps the two mutable/immutable layer borrows disjoint.
@@ -1823,6 +1831,72 @@ mod tests {
                         link = parent.next;
                     }
                 }
+            }
+        }
+    }
+
+    fn reveal_using_original_backup(search: &mut Search, kind: PieceKind) {
+        let depth = search.queue.len();
+        search.queue.push(kind);
+        search.cancel_stream();
+        if depth >= search.layers.len() {
+            return;
+        }
+        let mut updates = vec![Vec::new(); search.layers.len()];
+        let bit = 1 << kind as u8;
+        for (index, node) in search.layers[depth].nodes.iter_mut().enumerate() {
+            if let Some(children) = node.children.as_mut() {
+                if children.possibilities & bit == 0 {
+                    node.dead = true;
+                } else {
+                    children.possibilities = bit;
+                }
+                updates[depth].push(index as u32);
+            }
+        }
+        original_serial_propagate(search, updates);
+    }
+
+    #[test]
+    fn reveals_match_full_graph_backup_after_commits() {
+        for mode in [CavityMode::Reference, CavityMode::Geometric] {
+            let config = Config::for_threads(1);
+            let mut before =
+                Search::with_cavity_mode(config.clone(), Weights::default(), mode).unwrap();
+            let mut after = Search::with_cavity_mode(config, Weights::default(), mode).unwrap();
+            let stream: Vec<_> = [
+                PieceKind::T,
+                PieceKind::O,
+                PieceKind::I,
+                PieceKind::J,
+                PieceKind::L,
+                PieceKind::Z,
+                PieceKind::S,
+                PieceKind::J,
+                PieceKind::Z,
+                PieceKind::T,
+                PieceKind::S,
+                PieceKind::O,
+                PieceKind::I,
+                PieceKind::L,
+            ]
+            .into_iter()
+            .cycle()
+            .take(20)
+            .collect();
+            before.start(Board::default(), stream[..6].to_vec());
+            after.start(Board::default(), stream[..6].to_vec());
+            for (turn, kind) in stream[6..].iter().copied().enumerate().take(8) {
+                for _ in 0..if turn == 0 { 400 } else { 85 } {
+                    before.search_step();
+                    after.search_step();
+                }
+                let chosen = before.best_move().expect("fixture has a playable move");
+                before.advance(&chosen).unwrap();
+                after.advance(&chosen).unwrap();
+                reveal_using_original_backup(&mut before, kind);
+                after.add_next_piece(kind).unwrap();
+                assert_same_graph(&before, &after);
             }
         }
     }
