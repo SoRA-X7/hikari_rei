@@ -118,6 +118,8 @@ fn run() -> Result<(), String> {
                 danger: -40,
                 ren: 140,
                 b2b_destroy: -250,
+                hole_depth: 125,
+                max_height: 0,
                 ..Weights::default()
             },
         ),
