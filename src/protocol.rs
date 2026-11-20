@@ -302,18 +302,33 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
 }
 
 pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
-    run(config, weights, CavityMode::Reference)
+    run(config, weights, CavityMode::Reference, false)
 }
 
 /// Run TBP using physical column tops when classifying cavities and overhangs.
 pub fn run_tbp_with_geometric_cavities(config: Config, weights: Weights) -> Result<(), String> {
-    run(config, weights, CavityMode::Geometric)
+    run(config, weights, CavityMode::Geometric, false)
 }
 
-fn run(config: Config, weights: Weights, cavity_mode: CavityMode) -> Result<(), String> {
+/// Run TBP with geometric cavities and cubic rank weights for the first search branch.
+pub fn run_tbp_with_cubic_root_weights(config: Config, weights: Weights) -> Result<(), String> {
+    run(config, weights, CavityMode::Geometric, true)
+}
+
+fn run(
+    config: Config,
+    weights: Weights,
+    cavity_mode: CavityMode,
+    cubic_root_weights: bool,
+) -> Result<(), String> {
     let info = json!({"type":"info","name":"Hikari Rust","version":env!("CARGO_PKG_VERSION"),"author":"SoRA_X7",
         "features":["randomizer","move_info"],"reference_commit":crate::REFERENCE_COMMIT,"config":config});
     let search = Search::with_cavity_mode(config, weights, cavity_mode)?;
+    let search = if cubic_root_weights {
+        search.with_cubic_root_weights()
+    } else {
+        search
+    };
     let published = Arc::new(RwLock::new(
         json!({"type":"suggestion","moves":[],"position_id":0}),
     ));
