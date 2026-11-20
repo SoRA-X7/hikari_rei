@@ -112,7 +112,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Tbp { options } => protocol::run_tbp(options.config(), Weights::default()),
+        Command::Tbp { options } => protocol::run_tbp(
+            options.config(),
+            Weights {
+                ren: 140,
+                b2b_destroy: -250,
+                ..Weights::default()
+            },
+        ),
         Command::Ultra {
             options,
             seconds,
