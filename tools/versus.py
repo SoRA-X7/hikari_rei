@@ -92,11 +92,24 @@ def player(name, seed):
     return {'name':name,'bag':bag,'queue':[bag.draw() for _ in range(6)],'board':{'rows':[0]*24,'hold':None,'bag':0,'ren':0,'back_to_back':False},
             'pending':collections.deque(),'ready':0,'request':None,'active':None,'pieces':0,'lines':0,'attack':0,'sent':0,'received':0,'dead':False}
 
-def game(args, number, seed, order, rules, out):
+TIME_LIMIT_TIEBREAK = (('attack', 'apm'), ('sent', 'sent_apm'))
+
+def decide_winner(players, time_limit_tiebreak):
+    left, right = players
+    if left['dead'] != right['dead']:
+        return (right if left['dead'] else left)['name'], None
+    if time_limit_tiebreak and not left['dead']:
+        # Both players share the same match duration, so compare exact totals.
+        for total, metric in TIME_LIMIT_TIEBREAK:
+            if left[total] != right[total]:
+                return (left if left[total] > right[total] else right)['name'], metric
+    return None, None
+
+def game(args, number, seed, order, commands, rules, out):
     engines=[];players=[player(name,seed) for name in order];events=[];reason='time_limit';max_lag=0;lag_sum=0;frames=0
     try:
         for side,p in enumerate(players):
-            cmd=[str(args.hikari),'tbp','--threads','1'] if p['name']=='hikari' else [str(args.cold_clear)]
+            cmd=commands[p['name']]
             eng=Engine(cmd,out/f'game-{number}-side-{side}.jsonl');engines.append(eng);eng.send(start_message(p))
         time.sleep(args.countdown)
         base=time.monotonic();holes=[random.Random(seed^0xAAA),random.Random(seed^0xBBB)]
@@ -138,30 +151,92 @@ def game(args, number, seed, order, rules, out):
             for side,amount in enumerate(outgoing):
                 if amount:players[1-side]['pending'].append({'rows':amount,'due':frame+60,'hole':holes[side].randrange(10)})
             if any(p['dead'] for p in players):reason='top_out';break
-        dead=[p['dead'] for p in players];winner=None if dead[0]==dead[1] else players[1 if dead[0] else 0]['name']
-        result={'game':number,'seed':seed,'order':order,'winner':winner,'reason':reason,'seconds':frames/60,'wall_seconds':time.monotonic()-base,
-                'max_host_lag_seconds':max_lag,'mean_host_lag_seconds':lag_sum/frames,'players':[{k:p[k] for k in ['name','pieces','lines','attack','sent','received','dead','board']} for p in players],
+        winner, tiebreak = decide_winner(players, args.main is not None)
+        seconds = frames / 60
+        player_stats = []
+        for p in players:
+            stats = {k: p[k] for k in ['name', 'pieces', 'lines', 'attack', 'sent', 'received', 'dead', 'board']}
+            stats['apm'] = p['attack'] * 60 / seconds
+            stats['sent_apm'] = p['sent'] * 60 / seconds
+            stats['pps'] = p['pieces'] / seconds
+            player_stats.append(stats)
+        result={'game':number,'seed':seed,'order':order,'winner':winner,'reason':reason,'tiebreak':tiebreak,'seconds':seconds,'wall_seconds':time.monotonic()-base,
+                'max_host_lag_seconds':max_lag,'mean_host_lag_seconds':lag_sum/frames,'players':player_stats,
                 'events':events,'engine_info':[e.info for e in engines]}
         save(out/f'game-{number}.json',result);return result
     finally:
         for eng in engines:eng.close()
 
+def summarize_games(results, opponent_key, opponent_name):
+    hikari_wins = sum(game['winner'] == 'hikari' for game in results)
+    return {
+        'games': len(results),
+        'hikari_wins': hikari_wins,
+        f'{opponent_key}_wins': sum(game['winner'] == opponent_name for game in results),
+        'draws': sum(game['winner'] is None for game in results),
+        'hikari_win_rate': hikari_wins / len(results),
+        'results': results,
+    }
+
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--hikari',type=pathlib.Path,required=True);ap.add_argument('--cold-clear',type=pathlib.Path,required=True);ap.add_argument('--rules',type=pathlib.Path,required=True)
-    ap.add_argument('--output',type=pathlib.Path,required=True);ap.add_argument('--games',type=int,default=4);ap.add_argument('--seconds',type=int,default=180);ap.add_argument('--countdown',type=float,default=3);ap.add_argument('--seed',type=int,default=1611001)
-    args=ap.parse_args();out=args.output;out.mkdir(parents=True,exist_ok=False)
-    args.hikari=args.hikari.resolve();args.cold_clear=args.cold_clear.resolve();args.rules=args.rules.resolve()
-    manifest={'rules':__doc__,'seconds':args.seconds,'countdown':args.countdown,'seed':args.seed,'games':args.games,'workers_each':1,
-              'binaries':{k:{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for k,p in [('hikari',args.hikari),('cold_clear',args.cold_clear),('rules',args.rules)]}}
-    save(out/'manifest.json',manifest);rules=Rules(args.rules);results=[]
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--hikari', type=pathlib.Path, required=True)
+    opponent = ap.add_mutually_exclusive_group(required=True)
+    opponent.add_argument('--cold-clear', type=pathlib.Path, help='Cold Clear executable')
+    opponent.add_argument('--main', type=pathlib.Path, help='Baseline Hikari executable')
+    ap.add_argument('--rules', type=pathlib.Path, required=True)
+    ap.add_argument('--output', type=pathlib.Path, required=True)
+    ap.add_argument('--games', type=int, default=4)
+    ap.add_argument('--seconds', type=int, default=180)
+    ap.add_argument('--countdown', type=float, default=3)
+    ap.add_argument('--seed', type=int, default=1611001)
+    args = ap.parse_args()
+    if args.games < 1 or args.seconds < 1:
+        ap.error('--games and --seconds must be positive')
+
+    hikari = args.hikari.resolve()
+    rules_path = args.rules.resolve()
+    tbp_args = ['tbp', '--threads', '1']
+    if args.main is not None:
+        opponent_name = opponent_key = 'main'
+        opponent_path = args.main.resolve()
+        opponent_command = [str(opponent_path), *tbp_args]
+    else:
+        opponent_name, opponent_key = 'cold-clear-2', 'cold_clear'
+        opponent_path = args.cold_clear.resolve()
+        opponent_command = [str(opponent_path)]
+    commands = {'hikari': [str(hikari), *tbp_args], opponent_name: opponent_command}
+    binaries = {'hikari': hikari, opponent_key: opponent_path, 'rules': rules_path}
+
+    out = args.output
+    out.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        'rules': __doc__,
+        'seconds': args.seconds,
+        'countdown': args.countdown,
+        'seed': args.seed,
+        'games': args.games,
+        'workers_each': 1,
+        'time_limit_tiebreak': [metric for _, metric in TIME_LIMIT_TIEBREAK] if args.main is not None else [],
+        'binaries': {
+            name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            for name, path in binaries.items()
+        },
+    }
+    save(out / 'manifest.json', manifest)
+    rules = Rules(rules_path)
+    results = []
     try:
         for i in range(args.games):
-            order=['hikari','cold-clear-2'] if i%2==0 else ['cold-clear-2','hikari']
-            result=game(args,i,args.seed+i//2,order,rules,out);results.append({k:v for k,v in result.items() if k!='events'})
-            summary={'games':len(results),'hikari_wins':sum(r['winner']=='hikari' for r in results),'cold_clear_wins':sum(r['winner']=='cold-clear-2' for r in results),'draws':sum(r['winner'] is None for r in results),'results':results}
-            save(out/'summary.json',summary);print(json.dumps(results[-1],ensure_ascii=False),flush=True)
+            order = ['hikari', opponent_name] if i % 2 == 0 else [opponent_name, 'hikari']
+            result = game(args, i, args.seed + i // 2, order, commands, rules, out)
+            results.append({k: v for k, v in result.items() if k != 'events'})
+            save(out / 'summary.json', summarize_games(results, opponent_key, opponent_name))
+            print(json.dumps(results[-1], ensure_ascii=False), flush=True)
     except Exception as e:
-        save(out/'error.json',{'error':str(e),'completed_games':len(results)});raise
-    finally:rules.close()
+        save(out / 'error.json', {'error': str(e), 'completed_games': len(results)})
+        raise
+    finally:
+        rules.close()
 
 if __name__=='__main__':main()
