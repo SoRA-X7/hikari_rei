@@ -119,6 +119,7 @@ fn run() -> Result<(), String> {
                 b2b_destroy: -250,
                 hole_depth: 125,
                 max_height: 0,
+                hold_t: 35,
                 ..Weights::default()
             },
         ),
