@@ -98,3 +98,17 @@ jobs:
           path: ${{ runner.temp }}/summary.json
           overwrite: true
           if-no-files-found: error
+
+      - name: Fail if PR loses to main
+        run: |
+          python3 - "$RUNNER_TEMP/summary.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          result = json.loads(Path(sys.argv[1]).read_text())
+          wins, losses = result['hikari_wins'], result['main_wins']
+          if losses > wins:
+              print(f'::error::PR lost to main ({wins} wins, {losses} losses, {result["draws"]} draws).')
+              sys.exit(1)
+          PY
