@@ -49,7 +49,8 @@ def main():
         '| ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |'
     )
     winners = {'hikari': 'PR win', 'main': 'Main win', None: 'Draw'}
-    decisions = {'top_out': 'Top out', 'time_limit': 'Time limit', 'apm': 'APM', 'sent_apm': 'Sent APM'}
+    decisions = {'top_out': 'Top out', 'resign': 'Resignation', 'time_limit': 'Time limit',
+                 'apm': 'APM', 'sent_apm': 'Sent APM'}
     for number, game in enumerate(games, start=1):
         players = {player['name']: player for player in game['players']}
         pr, main = players['hikari'], players['main']

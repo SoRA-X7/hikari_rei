@@ -105,6 +105,15 @@ def decide_winner(players, time_limit_tiebreak):
                 return (left if left[total] > right[total] else right)['name'], metric
     return None, None
 
+def engine_resigned(message, player):
+    if not message.get('move_info', {}).get('search', {}).get('dead', False):
+        return False
+    board = message.get('board', {})
+    return message.get('queue') == player['queue'] and all(
+        board.get(key) == player['board'][key]
+        for key in ('rows', 'hold', 'ren', 'back_to_back')
+    )
+
 def game(args, number, seed, order, commands, rules, out):
     engines=[];players=[player(name,seed) for name in order];events=[];reason='time_limit';max_lag=0;lag_sum=0;frames=0
     try:
@@ -140,7 +149,11 @@ def game(args, number, seed, order, commands, rules, out):
                     p['request']=None;moves=msg.get('moves',[])
                     if not moves:
                         p['dead']=not rules.call(p['board'],p['queue'])['legal']
-                        if not p['dead']:raise RuntimeError('empty suggestion despite reachable placements')
+                        if not p['dead']:
+                            if not engine_resigned(msg, p):
+                                raise RuntimeError(f'{p["name"]}: empty suggestion despite reachable placements')
+                            p['dead'] = True
+                            reason = 'resign'
                     else:
                         mv=moves[0];plan=rules.call(p['board'],p['queue'],mv)
                         plan.update(move=mv,lock_frame=frame+plan['frames']);p['active']=plan
@@ -150,7 +163,10 @@ def game(args, number, seed, order, commands, rules, out):
                 if p['request'] is not None and frame-p['request']>180:raise RuntimeError(f'{p["name"]} no suggestion after3s')
             for side,amount in enumerate(outgoing):
                 if amount:players[1-side]['pending'].append({'rows':amount,'due':frame+60,'hole':holes[side].randrange(10)})
-            if any(p['dead'] for p in players):reason='top_out';break
+            if any(p['dead'] for p in players):
+                if reason == 'time_limit':
+                    reason = 'top_out'
+                break
         winner, tiebreak = decide_winner(players, args.main is not None)
         seconds = frames / 60
         player_stats = []
