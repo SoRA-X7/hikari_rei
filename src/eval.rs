@@ -613,27 +613,30 @@ fn cavities_and_overhangs(columns: &Int10, thresholds: &Int10, height: i32) -> (
     (empty_cells - overhangs, overhangs)
 }
 
-fn shape_collides(board: &Board, shape: [u8; 4], x: i32, y: i32) -> bool {
-    for (dy, row) in shape.into_iter().enumerate() {
-        for dx in 0..4 {
-            if row & (1 << dx) != 0 && board.occupied(x + dx, y + dy as i32) {
-                return true;
-            }
-        }
-    }
-    false
+fn slot_shape_collides(board: &Board, shape: [u8; 4], x: i32, y: i32) -> bool {
+    debug_assert!((-1..8).contains(&x));
+    let y = y as usize;
+    // Pad with a solid cell at x = -1 and x = 10.
+    const WALLS: u16 = 1 | (1 << 11);
+    board.rows[y..y + shape.len()]
+        .iter()
+        .zip(shape)
+        .any(|(field, row)| ((field << 1) | WALLS) & (u16::from(row) << (x + 1)) != 0)
+}
+
+fn t_double_slots(lower: u16, upper: u16) -> u16 {
+    // A bit marks the left corner. The lower middle and upper three cells
+    // must be empty, and the two lower corners must be occupied.
+    lower & (lower >> 2) & !(lower >> 1) & !(upper | (upper >> 1) | (upper >> 2)) & 0xff
 }
 
 fn scan_tspin(board: &Board, heights: &[i32; 10], height: i32) -> Option<TSpinHole> {
     let mut best: Option<TSpinHole> = None;
     for y in (0..=height - 3).rev() {
-        for x in 0..8 {
-            if shape_collides(board, [0b010, 0b111, 0, 0], x, y)
-                || !board.occupied(x, y)
-                || !board.occupied(x + 2, y)
-            {
-                continue;
-            }
+        let mut slots = t_double_slots(board.rows[y as usize], board.rows[y as usize + 1]);
+        while slots != 0 {
+            let x = slots.trailing_zeros() as i32;
+            slots &= slots - 1;
             if board.occupied(x, y + 2) {
                 if heights[x as usize + 1] > y + 1 || heights[x as usize + 2] > y + 1 {
                     continue;
@@ -664,7 +667,7 @@ fn scan_tst(board: &Board, heights: &[i32; 10], height: i32) -> Option<TSpinHole
     let mut best: Option<TSpinHole> = None;
     for y in (0..=height - 5).rev() {
         for x in -1..8 {
-            let rotation = if !shape_collides(board, [0b010, 0b110, 0b010, 0b110], x, y)
+            let rotation = if !slot_shape_collides(board, [0b010, 0b110, 0b010, 0b110], x, y)
                 && !board.occupied(x + 3, y + 3)
                 && board.occupied(x + 1, y + 4)
                 && board.occupied(x + 2, y + 2)
@@ -681,7 +684,7 @@ fn scan_tst(board: &Board, heights: &[i32; 10], height: i32) -> Option<TSpinHole
                     continue;
                 }
                 1
-            } else if !shape_collides(board, [0b010, 0b011, 0b010, 0b011], x, y)
+            } else if !slot_shape_collides(board, [0b010, 0b011, 0b010, 0b011], x, y)
                 && !board.occupied(x - 1, y + 3)
                 && board.occupied(x + 1, y + 4)
                 && board.occupied(x, y + 2)
@@ -800,6 +803,43 @@ mod tests {
         let (bits, heights) = columns(&b);
         let thresholds = geometric_tops(&bits, &heights);
         assert_eq!(cavities_and_overhangs(&bits, &thresholds, 3), (1, 2));
+    }
+
+    #[test]
+    fn t_double_slot_mask_matches_individual_cells() {
+        for lower in 0..1024u16 {
+            for upper in 0..1024u16 {
+                let mut expected = 0;
+                for x in 0..8 {
+                    if (lower >> x) & 0b111 == 0b101 && (upper >> x) & 0b111 == 0 {
+                        expected |= 1 << x;
+                    }
+                }
+                assert_eq!(t_double_slots(lower, upper), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn padded_tst_slot_collision_matches_individual_cells() {
+        let shapes = [[0b010, 0b110, 0b010, 0b110], [0b010, 0b011, 0b010, 0b011]];
+        let mut b = board();
+        for y in [0, 1, 10, 19, 20] {
+            for cell in 0..40 {
+                b.rows[y..y + 4].fill(0);
+                b.rows[y + cell / 10] = 1 << (cell % 10);
+                for shape in shapes {
+                    for x in -1..8 {
+                        let expected = shape.iter().enumerate().any(|(dy, &row)| {
+                            (0..4).any(|dx| {
+                                row & (1 << dx) != 0 && b.occupied(x + dx, (y + dy) as i32)
+                            })
+                        });
+                        assert_eq!(slot_shape_collides(&b, shape, x, y as i32), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
