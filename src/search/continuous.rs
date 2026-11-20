@@ -58,7 +58,12 @@ impl Stream {
     }
 }
 
-pub(super) fn prepare(selected: Selected, use_hold: bool, weights: &Weights) -> Expansion {
+pub(super) fn prepare(
+    selected: Selected,
+    use_hold: bool,
+    weights: &Weights,
+    cavity_mode: CavityMode,
+) -> Expansion {
     let mut held_copies = Vec::new();
     let mut expansion =
         make_expansion_with_held_copies(selected, use_hold, weights, |first, start, count| {
@@ -67,7 +72,8 @@ pub(super) fn prepare(selected: Selected, use_hold: bool, weights: &Weights) -> 
     #[cfg(feature = "profile-search")]
     let clock = ProfileClock::start();
     if !expansion.dead {
-        let evaluate = |edge: &PlannedEdge| evaluate_board(&edge.board, weights);
+        let evaluate =
+            |edge: &PlannedEdge| evaluate_board_with_cavities(&edge.board, weights, cavity_mode);
         let edges = &expansion.edges;
         if held_copies.is_empty() {
             expansion.evaluations = Some(edges.iter().map(evaluate).collect());
@@ -135,6 +141,7 @@ impl Search {
         let sender = self.stream.sender.clone();
         let weights = Arc::clone(&self.stream.weights);
         let use_hold = self.config.use_hold;
+        let cavity_mode = self.cavity_mode;
         let jobs = selected.len();
         // Credits count leaves, including cancelled generations. Pending
         // selection buffers acquire credits only when submitted to the pool.
@@ -163,7 +170,7 @@ impl Search {
                     for selected in selected {
                         scope.spawn_fifo(move |_| {
                             let expansion = (revision.load(Ordering::Relaxed) == generation)
-                                .then(|| prepare(selected, use_hold, weights));
+                                .then(|| prepare(selected, use_hold, weights, cavity_mode));
                             // Publish each result immediately. The controller
                             // never waits for the rest of this dispatch group.
                             let _ = sender.send(Completion {
@@ -293,7 +300,12 @@ impl Search {
                 self.profile.selection_cpu_ns += cpu;
             }
             return selected.map_or(0, |selected| {
-                let expansion = prepare(selected, self.config.use_hold, &self.weights);
+                let expansion = prepare(
+                    selected,
+                    self.config.use_hold,
+                    &self.weights,
+                    self.cavity_mode,
+                );
                 #[cfg(feature = "profile-search")]
                 {
                     self.profile.expansion_wall_ns += expansion.profile.expansion_wall_ns;

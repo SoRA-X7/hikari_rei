@@ -14,7 +14,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::board::{Board, LockResult, Piece, PieceKind};
-use crate::eval::{Reward, Value, Weights, evaluate_board, evaluate_move};
+#[cfg(test)]
+use crate::eval::evaluate_board;
+use crate::eval::{
+    CavityMode, Reward, Value, Weights, evaluate_board_with_cavities, evaluate_move,
+};
 #[cfg(feature = "fast-registration")]
 use crate::graph_storage::{BoardLookup, board_hash};
 use crate::movegen;
@@ -611,6 +615,7 @@ impl Random {
 pub struct Search {
     config: Config,
     weights: Weights,
+    cavity_mode: CavityMode,
     board: Board,
     queue: Vec<PieceKind>,
     pending: VecDeque<PieceKind>,
@@ -631,6 +636,14 @@ pub struct Search {
 
 impl Search {
     pub fn new(config: Config, weights: Weights) -> Result<Self, String> {
+        Self::with_cavity_mode(config, weights, CavityMode::Reference)
+    }
+
+    pub(crate) fn with_cavity_mode(
+        config: Config,
+        weights: Weights,
+        cavity_mode: CavityMode,
+    ) -> Result<Self, String> {
         config.validate()?;
         let pool = if config.threads == 1 {
             None
@@ -648,6 +661,7 @@ impl Search {
         Ok(Self {
             config,
             weights,
+            cavity_mode,
             board: Board::default(),
             queue: Vec::new(),
             pending: VecDeque::new(),
@@ -1094,7 +1108,11 @@ impl Search {
         // The graph has already merged transpositions, so each newly inserted
         // board is evaluated once, even when many expansion parents found it.
         let evaluate = |&(depth, node, board): &(usize, u32, Board)| {
-            (depth, node, evaluate_board(&board, &self.weights))
+            (
+                depth,
+                node,
+                evaluate_board_with_cavities(&board, &self.weights, self.cavity_mode),
+            )
         };
         let values: Vec<_> = if evaluations.is_empty() {
             Vec::new()
@@ -1345,7 +1363,12 @@ impl Search {
         if self.layers[0].nodes[self.root as usize].children.is_none() && self.can_expand_root() {
             let seed = self.rng.next();
             if let Some(selected) = self.select(&mut Random(seed), true) {
-                let expansion = continuous::prepare(selected, self.config.use_hold, &self.weights);
+                let expansion = continuous::prepare(
+                    selected,
+                    self.config.use_hold,
+                    &self.weights,
+                    self.cavity_mode,
+                );
                 self.register_expansions(vec![expansion], true);
             }
         }
@@ -1402,6 +1425,7 @@ impl Search {
                 },
                 self.config.use_hold,
                 &self.weights,
+                self.cavity_mode,
             );
             self.register_expansions(vec![expansion], true);
         }
@@ -2243,13 +2267,17 @@ mod tests {
                     };
                     let planned = make_expansion(selected, true, &weights);
                     if !planned.dead {
-                        let prepared = continuous::prepare(selected, true, &weights);
-                        let expected: Vec<_> = planned
-                            .edges
-                            .iter()
-                            .map(|edge| evaluate_board(&edge.board, &weights))
-                            .collect();
-                        assert_eq!(prepared.evaluations, Some(expected));
+                        for mode in [CavityMode::Reference, CavityMode::Geometric] {
+                            let prepared = continuous::prepare(selected, true, &weights, mode);
+                            let expected: Vec<_> = planned
+                                .edges
+                                .iter()
+                                .map(|edge| {
+                                    evaluate_board_with_cavities(&edge.board, &weights, mode)
+                                })
+                                .collect();
+                            assert_eq!(prepared.evaluations, Some(expected));
+                        }
                     }
                     let mut offset = 0;
                     let mut lengths = [0; 7];

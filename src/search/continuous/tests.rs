@@ -152,7 +152,12 @@ fn start_and_reset_discard_results_even_when_root_ids_are_reused() {
         let mut search = search(2, 50_000);
         search.start(Board::default(), queue());
         let old_generation = generation(&search);
-        let expansion = prepare(selected(&search), false, &search.weights);
+        let expansion = prepare(
+            selected(&search),
+            false,
+            &search.weights,
+            search.cavity_mode,
+        );
         inject(&mut search, old_generation, expansion);
 
         let mut replacement = Board::default();
@@ -186,7 +191,7 @@ fn preview_revelation_discards_speculative_work_without_invalidating_chosen_move
     assert_eq!(selection.depth, 1);
     assert!(selection.candidates.count_ones() > 1);
     let key = (selection.depth, selection.node);
-    let expansion = prepare(selection, false, &search.weights);
+    let expansion = prepare(selection, false, &search.weights, search.cavity_mode);
     inject(&mut search, old_generation, expansion);
 
     search.add_next_piece(PieceKind::I).unwrap();
@@ -207,7 +212,12 @@ fn commit_discards_pending_work_from_the_previous_layer_numbers() {
     assert_eq!(search.search_batch(), 1);
     let chosen = search.best_move().unwrap();
     let old_generation = generation(&search);
-    let expansion = prepare(selected(&search), false, &search.weights);
+    let expansion = prepare(
+        selected(&search),
+        false,
+        &search.weights,
+        search.cavity_mode,
+    );
     inject(&mut search, old_generation, expansion);
 
     search.advance(&chosen).unwrap();
@@ -284,7 +294,12 @@ fn node_cap_rejects_an_entire_expansion_and_never_publishes_partial_children() {
 
         let mut search = search(threads, 50_000);
         search.start(Board::default(), queue());
-        let expansion = prepare(selected(&search), false, &search.weights);
+        let expansion = prepare(
+            selected(&search),
+            false,
+            &search.weights,
+            search.cavity_mode,
+        );
         assert!(!expansion.dead);
         let expected_edges = expansion.edges.len();
         let fresh: HashSet<_> = expansion.edges.iter().map(|edge| edge.board).collect();
@@ -317,7 +332,12 @@ fn reference_batch_cancels_stream_work_before_expanding_the_same_leaf() {
     reference.start(Board::default(), queue());
     actual.start(Board::default(), queue());
     let old_generation = generation(&actual);
-    let expansion = prepare(selected(&actual), false, &actual.weights);
+    let expansion = prepare(
+        selected(&actual),
+        false,
+        &actual.weights,
+        actual.cavity_mode,
+    );
     inject(&mut actual, old_generation, expansion);
 
     assert_eq!(actual.search_batch(), reference.search_batch());
@@ -340,7 +360,12 @@ fn published_children_already_have_their_board_evaluations() {
     for threads in [1, 2, 4] {
         let mut search = search(threads, 50_000);
         search.start(Board::default(), queue());
-        let expansion = prepare(selected(&search), false, &search.weights);
+        let expansion = prepare(
+            selected(&search),
+            false,
+            &search.weights,
+            search.cavity_mode,
+        );
         assert!(!expansion.dead);
         let expected: Vec<_> = expansion
             .edges
@@ -373,7 +398,7 @@ fn a_late_result_for_an_expanded_node_cannot_append_its_edges_twice() {
     assert_eq!(search.search_step(), 1);
     search.pause();
     let current_generation = generation(&search);
-    let expansion = prepare(selection, false, &search.weights);
+    let expansion = prepare(selection, false, &search.weights, search.cavity_mode);
     inject(&mut search, current_generation, expansion);
     let before = graph(&search);
 

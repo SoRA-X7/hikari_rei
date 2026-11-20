@@ -1,7 +1,7 @@
 //! TBP adapter. The worker starts pondering on `start`, including the countdown.
 //! `suggest` asks the worker for its current result; `play` confirms and advances a move.
 use crate::board::{Board, HEIGHT, Piece, PieceKind, TSpin};
-use crate::eval::Weights;
+use crate::eval::{CavityMode, Weights};
 use crate::movegen::{Path, find_path};
 use crate::search::{Config, Search};
 use serde_json::{Value, json};
@@ -302,9 +302,18 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
 }
 
 pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
+    run(config, weights, CavityMode::Reference)
+}
+
+/// Run TBP using physical column tops when classifying cavities and overhangs.
+pub fn run_tbp_with_geometric_cavities(config: Config, weights: Weights) -> Result<(), String> {
+    run(config, weights, CavityMode::Geometric)
+}
+
+fn run(config: Config, weights: Weights, cavity_mode: CavityMode) -> Result<(), String> {
     let info = json!({"type":"info","name":"Hikari Rust","version":env!("CARGO_PKG_VERSION"),"author":"SoRA_X7",
         "features":["randomizer","move_info"],"reference_commit":crate::REFERENCE_COMMIT,"config":config});
-    let search = Search::new(config, weights)?;
+    let search = Search::with_cavity_mode(config, weights, cavity_mode)?;
     let published = Arc::new(RwLock::new(
         json!({"type":"suggestion","moves":[],"position_id":0}),
     ));
