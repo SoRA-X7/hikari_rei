@@ -348,12 +348,29 @@ impl Board {
     /// Bit columns and highest occupied row (zero also represents empty).
     pub fn columns(&self) -> ([u32; WIDTH], [u8; WIDTH]) {
         let mut columns = [0u32; WIDTH];
-        for (y, row) in self.rows.iter().copied().enumerate() {
-            let mut occupied = row & FILLED;
-            while occupied != 0 {
-                let x = occupied.trailing_zeros() as usize;
-                columns[x] |= 1 << y;
-                occupied &= occupied - 1;
+        for (block, rows) in self.rows.as_chunks::<4>().0.iter().enumerate() {
+            let packed = u64::from(rows[0])
+                | (u64::from(rows[1]) << 16)
+                | (u64::from(rows[2]) << 32)
+                | (u64::from(rows[3]) << 48);
+            let packed = packed & 0x03ff_03ff_03ff_03ff;
+            if packed == 0 {
+                continue;
+            }
+
+            // Move the two high row-index bits below the column-index bits.
+            // Each resulting four-bit group contains a column's four rows.
+            let swap = |bits: u64, stride: usize, mask: u64| {
+                let moved = (bits ^ (bits >> stride)) & mask;
+                bits ^ moved ^ (moved << stride)
+            };
+            let packed = swap(packed, 3, 0x0a0a_0a0a_0a0a_0a0a);
+            let packed = swap(packed, 15, 0x0000_aaaa_0000_aaaa);
+            let packed = swap(packed, 6, 0x00cc_00cc_00cc_00cc);
+            let packed = swap(packed, 30, 0x0000_0000_cccc_cccc);
+            for (x, column) in columns.iter_mut().enumerate() {
+                let rows = (packed >> (4 * x)) as u32 & 0xf;
+                *column |= rows << (4 * block);
             }
         }
         let heights = columns.map(|column| 31u32.saturating_sub(column.leading_zeros()) as u8);
@@ -587,6 +604,53 @@ mod tests {
             [1, 0, 0, 0, 0, 0, 0, 0, 0, 1 | (1 << 5) | (1 << 23)]
         );
         assert_eq!(heights, [0, 0, 0, 0, 0, 0, 0, 0, 0, 23]);
+    }
+
+    #[test]
+    fn transposed_columns_match_the_coordinate_oracle() {
+        fn compare(board: &Board) {
+            let expected = std::array::from_fn(|x| {
+                let mut mask = 0;
+                let mut top = 0;
+                for y in 0..HEIGHT {
+                    if board.rows[y] & (1 << x) != 0 {
+                        mask |= 1 << y;
+                        top = y as u8;
+                    }
+                }
+                (mask, top)
+            });
+            assert_eq!(
+                board.columns(),
+                (expected.map(|(mask, _)| mask), expected.map(|(_, top)| top)),
+                "{board:?}",
+            );
+        }
+
+        for y in 0..HEIGHT {
+            for x in 0..u16::BITS {
+                let mut board = Board::default();
+                board.rows[y] = 1 << x;
+                compare(&board);
+            }
+        }
+        let mut seed = 0x90aa_671d_ec50_2e21_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u16
+        };
+        for case in 0..2048 {
+            let mut board = Board::default();
+            for row in &mut board.rows[..case % (HEIGHT + 1)] {
+                *row = next();
+                for _ in 0..case % 5 {
+                    *row &= next();
+                }
+            }
+            compare(&board);
+        }
     }
 
     // Keep the original row-based implementation as a differential oracle.
