@@ -5,6 +5,7 @@
 use crate::board::{Board, Piece, PieceKind, TSpin};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 #[cfg(feature = "fast-low-stack")]
 use std::sync::OnceLock;
 
@@ -64,9 +65,41 @@ struct StepRef {
     cost: i32,
 }
 
+// The movement tables only store fixed-width keys made from bounded piece
+// coordinates. Equality still compares the full key.
+#[derive(Default)]
+struct MoveKeyHasher(u64);
+
+impl Hasher for MoveKeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = self.0.rotate_left(5) ^ u64::from(value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 33)
+    }
+}
+
+type MoveKeyHash = BuildHasherDefault<MoveKeyHasher>;
+
+fn move_key(piece: Piece) -> u32 {
+    u32::from_le_bytes([
+        piece.x as u8,
+        piece.y as u8,
+        piece.kind as u8,
+        piece.rotation() | ((piece.tspin() as u8) << 2),
+    ])
+}
+
 #[cfg(feature = "fast-low-stack")]
 struct AirStarts {
-    tree: HashMap<Piece, Step>,
+    tree: HashMap<u32, Step, MoveKeyHash>,
     order: Vec<StepRef>,
 }
 
@@ -83,7 +116,7 @@ fn air_starts(kind: PieceKind) -> &'static AirStarts {
             let spawned = Piece::spawn(kind);
             let mut mirai = Mirai::new(&board);
             mirai.tree.insert(
-                spawned,
+                move_key(spawned),
                 Step {
                     parent: None,
                     cost: 0,
@@ -98,7 +131,7 @@ fn air_starts(kind: PieceKind) -> &'static AirStarts {
             });
             let mut order = Vec::with_capacity(40);
             while let Some(current) = mirai.next.pop() {
-                let origin = mirai.tree[&current.piece];
+                let origin = mirai.tree[&move_key(current.piece)];
                 order.push(current);
                 if origin.depth < MAX_INSTRUCTIONS {
                     mirai.append_air_moves(origin, kind);
@@ -159,10 +192,10 @@ impl Queue {
 
 struct Mirai<'a> {
     board: &'a Board,
-    tree: HashMap<Piece, Step>,
+    tree: HashMap<u32, Step, MoveKeyHash>,
     next: Queue,
     locked: Vec<(Piece, StepRef)>,
-    locked_keys: HashSet<Piece>,
+    locked_keys: HashSet<u32, MoveKeyHash>,
     // Original uses a 32-bit hash of the four cells plus spin. Store the exact
     // cell set and spin here so unrelated placements cannot collide and vanish.
     deduplicator: HashSet<([(i32, i32); 4], TSpin)>,
@@ -173,10 +206,10 @@ impl<'a> Mirai<'a> {
     fn new(board: &'a Board) -> Self {
         Self {
             board,
-            tree: HashMap::with_capacity(500),
+            tree: HashMap::with_capacity_and_hasher(500, MoveKeyHash::default()),
             next: Queue(Vec::with_capacity(500)),
             locked: Vec::with_capacity(100),
-            locked_keys: HashSet::with_capacity(100),
+            locked_keys: HashSet::with_capacity_and_hasher(100, MoveKeyHash::default()),
             deduplicator: HashSet::with_capacity(100),
             #[cfg(feature = "prune-low-stack")]
             prune_heights: None,
@@ -195,7 +228,7 @@ impl<'a> Mirai<'a> {
         self.generate_full(spawned);
     }
     fn generate_full(&mut self, spawned: Piece) {
-        if self.tree.contains_key(&spawned) {
+        if self.tree.contains_key(&move_key(spawned)) {
             return;
         }
         self.deduplicator.clear();
@@ -206,7 +239,7 @@ impl<'a> Mirai<'a> {
             piece: spawned,
             inst: Instruction::None,
         };
-        self.tree.insert(spawned, root);
+        self.tree.insert(move_key(spawned), root);
         self.next.push(StepRef {
             piece: spawned,
             cost: 0,
@@ -215,7 +248,7 @@ impl<'a> Mirai<'a> {
     }
     #[cfg(feature = "fast-low-stack")]
     fn generate_low_stack(&mut self, kind: PieceKind) {
-        if self.tree.contains_key(&Piece::spawn(kind)) {
+        if self.tree.contains_key(&move_key(Piece::spawn(kind))) {
             return;
         }
         self.deduplicator.clear();
@@ -229,7 +262,7 @@ impl<'a> Mirai<'a> {
         // occupied cell is at least row 17. Register their direct hard drops,
         // then retain the original cost/depth gates for further stack moves.
         for &current in &starts.order {
-            let origin = self.tree[&current.piece];
+            let origin = self.tree[&move_key(current.piece)];
             let Some(dropped) = self.board.sonic_drop(current.piece) else {
                 continue;
             };
@@ -260,7 +293,7 @@ impl<'a> Mirai<'a> {
     fn drain_queue(&mut self, kind: PieceKind) {
         while let Some(current) = self.next.pop() {
             let piece = current.piece;
-            let origin = self.tree[&piece];
+            let origin = self.tree[&move_key(piece)];
             let Some(dropped) = self.board.sonic_drop(piece) else {
                 continue;
             };
@@ -296,7 +329,7 @@ impl<'a> Mirai<'a> {
         if self
             .deduplicator
             .insert((dropped.cells(), current.piece.tspin()))
-            && self.locked_keys.insert(dropped)
+            && self.locked_keys.insert(move_key(dropped))
         {
             self.locked.push((dropped, current));
         }
@@ -334,7 +367,8 @@ impl<'a> Mirai<'a> {
             piece: result,
             inst,
         };
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.tree.entry(result) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.tree.entry(move_key(result))
+        {
             entry.insert(step);
             // The depth-16 state is stored for reconstruction but never expanded.
             if step.depth < MAX_INSTRUCTIONS && (result.kind == PieceKind::T || step.cost < 20) {
@@ -349,8 +383,8 @@ impl<'a> Mirai<'a> {
         let (_, current) = self.locked.iter().find(|(piece, _)| *piece == to)?;
         let mut instructions = Vec::new();
         let mut leaf = current.piece;
-        while let Some(parent) = self.tree[&leaf].parent {
-            instructions.push(self.tree[&leaf].inst);
+        while let Some(parent) = self.tree[&move_key(leaf)].parent {
+            instructions.push(self.tree[&move_key(leaf)].inst);
             leaf = parent;
         }
         instructions.reverse();
@@ -395,6 +429,23 @@ pub use path::find_path;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movement_keys_distinguish_signed_coordinates_rotations_and_spins() {
+        let mut keys = HashSet::new();
+        for kind in PieceKind::ALL {
+            for rotation in 0..4 {
+                for spin in [TSpin::None, TSpin::Mini, TSpin::Full] {
+                    for x in [i8::MIN, -1, 0, 1, i8::MAX] {
+                        for y in [i8::MIN, -1, 0, 1, i8::MAX] {
+                            let piece = Piece::new(kind, x, y, rotation).with_tspin(spin);
+                            assert!(keys.insert(move_key(piece)), "{piece:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[cfg(feature = "fast-low-stack")]
     fn check_replay(board: &Board, path: &Path) {
         let target = path.result.unwrap();
@@ -508,8 +559,8 @@ mod tests {
                 assert!(current.piece.cells().iter().all(|&(_, y)| y >= 17));
                 let mut instructions = Vec::new();
                 let mut leaf = current.piece;
-                while let Some(parent) = starts.tree[&leaf].parent {
-                    instructions.push(starts.tree[&leaf].inst);
+                while let Some(parent) = starts.tree[&move_key(leaf)].parent {
+                    instructions.push(starts.tree[&move_key(leaf)].inst);
                     leaf = parent;
                 }
                 instructions.reverse();
