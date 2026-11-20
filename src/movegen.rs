@@ -157,15 +157,42 @@ impl Queue {
     }
 }
 
+// Shift each fixed 4x4 shape to its lowest occupied row and leftmost column.
+// Equivalent rotations then share the same shape mask and occupied origin.
+const LOCK_FOOTPRINTS: [[(i16, i16, u16); 4]; 7] = {
+    let mut table = [[(0, 0, 0); 4]; 7];
+    let mut kind = 0;
+    while kind < 7 {
+        let mut rotation = 0;
+        while rotation < 4 {
+            let rows = Piece::new(PieceKind::ALL[kind], 0, 0, rotation as u8).shape();
+            let mask = rows[0] | (rows[1] << 4) | (rows[2] << 8) | (rows[3] << 12);
+            let x = (rows[0] | rows[1] | rows[2] | rows[3]).trailing_zeros();
+            let y = mask.trailing_zeros() / 4;
+            table[kind][rotation] = (x as i16, y as i16, mask >> (4 * y + x));
+            rotation += 1;
+        }
+        kind += 1;
+    }
+    table
+};
+
+fn lock_key(piece: Piece, spin: TSpin) -> u64 {
+    let (offset_x, offset_y, shape) =
+        LOCK_FOOTPRINTS[piece.kind as usize][piece.rotation() as usize];
+    let x = (i16::from(piece.x) + offset_x) as u16;
+    let y = (i16::from(piece.y) + offset_y) as u16;
+    u64::from(shape) | (u64::from(x) << 16) | (u64::from(y) << 32) | ((spin as u64) << 48)
+}
+
 struct Mirai<'a> {
     board: &'a Board,
     tree: HashMap<Piece, Step>,
     next: Queue,
     locked: Vec<(Piece, StepRef)>,
     locked_keys: HashSet<Piece>,
-    // Original uses a 32-bit hash of the four cells plus spin. Store the exact
-    // cell set and spin here so unrelated placements cannot collide and vanish.
-    deduplicator: HashSet<([(i32, i32); 4], TSpin)>,
+    // The key encodes the exact occupied cells and spin.
+    deduplicator: HashSet<u64>,
     #[cfg(feature = "prune-low-stack")]
     prune_heights: Option<[u8; crate::board::WIDTH]>,
 }
@@ -307,7 +334,7 @@ impl<'a> Mirai<'a> {
     fn record_lock(&mut self, dropped: Piece, current: StepRef) {
         if self
             .deduplicator
-            .insert((dropped.cells(), current.piece.tspin()))
+            .insert(lock_key(dropped, current.piece.tspin()))
             && self.locked_keys.insert(dropped)
         {
             self.locked.push((dropped, current));
@@ -487,6 +514,27 @@ mod tests {
             find_path(&board, canonical.with_tspin(TSpin::Full), false),
             None
         );
+    }
+
+    #[test]
+    fn packed_lock_keys_match_exact_cell_sets() {
+        let mut keys = HashMap::new();
+        let mut cells = HashMap::new();
+        for kind in PieceKind::ALL {
+            for rotation in 0..4 {
+                for x in [-128, -2, -1, 0, 1, 127] {
+                    for y in [-128, -2, -1, 0, 1, 127] {
+                        for spin in [TSpin::None, TSpin::Mini, TSpin::Full] {
+                            let piece = Piece::new(kind, x, y, rotation);
+                            let key = lock_key(piece, spin);
+                            let exact = (piece.cells(), spin);
+                            assert_eq!(*keys.entry(key).or_insert(exact), exact);
+                            assert_eq!(*cells.entry(exact).or_insert(key), key);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
