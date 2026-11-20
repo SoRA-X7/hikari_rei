@@ -1,0 +1,114 @@
+name: PR versus main
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  PR_SHA: ${{ github.event.pull_request.head.sha }}
+  MAIN_SHA: ${{ github.event.pull_request.base.sha }}
+  FIRST_SEED: '1611001'
+  SEED_COUNT: '20'
+
+jobs:
+  versus:
+    name: Play matches (shard ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - name: Check out PR
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.MAIN_SHA }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Build PR engine
+        working-directory: candidate
+        run: cargo +stable build --locked --release --bin hikari_rei --target-dir "$RUNNER_TEMP/target-pr"
+
+      - name: Build main engine and shared rules
+        working-directory: baseline
+        run: cargo +stable build --locked --release --bin hikari_rei --example arena_rules --target-dir "$RUNNER_TEMP/target-main"
+
+      - name: Play matches
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 candidate/tools/versus.py \
+            --hikari "$RUNNER_TEMP/target-pr/release/hikari_rei" \
+            --main "$RUNNER_TEMP/target-main/release/hikari_rei" \
+            --rules "$RUNNER_TEMP/target-main/release/examples/arena_rules" \
+            --seed "$((FIRST_SEED + SHARD * 2))" --games 4 \
+            --output "$RUNNER_TEMP/hikari-versus"
+
+      - name: Upload match results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hikari-versus-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/hikari-versus
+          overwrite: true
+          if-no-files-found: ignore
+
+  report:
+    name: Record PR win rate
+    needs: versus
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out PR
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR_SHA }}
+          persist-credentials: false
+
+      - name: Download match results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: hikari-versus-shard-*
+          path: ${{ runner.temp }}/versus-shards
+
+      - name: Record win rate
+        run: |
+          python3 tools/report_versus.py \
+            --pr-sha "$PR_SHA" --main-sha "$MAIN_SHA" \
+            --first-seed "$FIRST_SEED" --seed-count "$SEED_COUNT" \
+            --output "$RUNNER_TEMP/summary.json" \
+            "$RUNNER_TEMP/versus-shards"/hikari-versus-shard-*/summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@v7
+        with:
+          name: hikari-versus-main
+          path: ${{ runner.temp }}/summary.json
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Fail if PR loses to main
+        run: |
+          python3 - "$RUNNER_TEMP/summary.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          result = json.loads(Path(sys.argv[1]).read_text())
+          wins, losses = result['hikari_wins'], result['main_wins']
+          if losses > wins:
+              print(f'::error::PR lost to main ({wins} wins, {losses} losses, {result["draws"]} draws).')
+              sys.exit(1)
+          PY

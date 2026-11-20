@@ -498,17 +498,8 @@ fn ren_attack(ren: i32) -> i32 {
 
 /// `tops` are zero based, with zero also used for an empty column.
 fn columns(board: &Board) -> ([i32; 10], [i32; 10]) {
-    let mut columns = [0; 10];
-    let mut tops = [0; 10];
-    for x in 0..10 {
-        for y in 0..24 {
-            if board.rows[y] & (1 << x) != 0 {
-                tops[x] = y as i32;
-                columns[x] |= 1 << y;
-            }
-        }
-    }
-    (columns, tops)
+    let (columns, tops) = board.columns();
+    (columns.map(|column| column as i32), tops.map(i32::from))
 }
 
 fn max_height(board: &Board, filter: u16) -> i32 {

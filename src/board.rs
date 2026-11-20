@@ -347,16 +347,16 @@ impl Board {
     }
     /// Bit columns and highest occupied row (zero also represents empty).
     pub fn columns(&self) -> ([u32; WIDTH], [u8; WIDTH]) {
-        let mut columns = [0; WIDTH];
-        let mut heights = [0; WIDTH];
-        for x in 0..WIDTH {
-            for y in 0..HEIGHT {
-                if self.rows[y] & (1 << x) != 0 {
-                    columns[x] |= 1 << y;
-                    heights[x] = y as u8;
-                }
+        let mut columns = [0u32; WIDTH];
+        for (y, row) in self.rows.iter().copied().enumerate() {
+            let mut occupied = row & FILLED;
+            while occupied != 0 {
+                let x = occupied.trailing_zeros() as usize;
+                columns[x] |= 1 << y;
+                occupied &= occupied - 1;
             }
         }
+        let heights = columns.map(|column| 31u32.saturating_sub(column.leading_zeros()) as u8);
         (columns, heights)
     }
     pub fn check_tspin(&self, piece: Piece, kick: u8) -> TSpin {
@@ -573,6 +573,21 @@ const KICKS_I: [[(i8, i8); 4]; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_preserve_empty_tops_and_ignore_bits_outside_the_field() {
+        let mut board = Board::default();
+        board.rows[0] = (1 << 0) | (1 << 9);
+        board.rows[5] = 1 << 9;
+        board.rows[23] = (1 << 9) | (1 << 15);
+
+        let (columns, heights) = board.columns();
+        assert_eq!(
+            columns,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1 | (1 << 5) | (1 << 23)]
+        );
+        assert_eq!(heights, [0, 0, 0, 0, 0, 0, 0, 0, 0, 23]);
+    }
 
     // Keep the original row-based implementation as a differential oracle.
     fn scalar_collides(board: &Board, piece: Piece) -> bool {
