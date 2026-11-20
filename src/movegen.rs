@@ -5,7 +5,6 @@
 use crate::board::{Board, Piece, PieceKind, TSpin};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "fast-low-stack")]
 use std::sync::OnceLock;
 
 pub const MAX_INSTRUCTIONS: usize = 16;
@@ -157,8 +156,41 @@ impl Queue {
     }
 }
 
+const AIR_X_MIN: i8 = -3;
+const AIR_X_COUNT: usize = 13;
+
+struct SpawnMoves {
+    shift_left: bool,
+    shift_right: bool,
+    rotations: [Option<Piece>; 2],
+}
+
+type SpawnMoveTable = [[[SpawnMoves; AIR_X_COUNT]; 4]; 7];
+
+fn spawn_moves() -> &'static SpawnMoveTable {
+    static CACHE: OnceLock<SpawnMoveTable> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let empty = Board::default();
+        std::array::from_fn(|kind| {
+            let kind = PieceKind::ALL[kind];
+            let y = Piece::spawn(kind).y;
+            std::array::from_fn(|rotation| {
+                std::array::from_fn(|column| {
+                    let piece = Piece::new(kind, AIR_X_MIN + column as i8, y, rotation as u8);
+                    SpawnMoves {
+                        shift_left: !empty.collides(piece.shifted(-1, 0)),
+                        shift_right: !empty.collides(piece.shifted(1, 0)),
+                        rotations: [empty.rotate(piece, true), empty.rotate(piece, false)],
+                    }
+                })
+            })
+        })
+    })
+}
+
 struct Mirai<'a> {
     board: &'a Board,
+    spawn_moves: Option<&'static SpawnMoveTable>,
     tree: HashMap<Piece, Step>,
     next: Queue,
     locked: Vec<(Piece, StepRef)>,
@@ -173,6 +205,9 @@ impl<'a> Mirai<'a> {
     fn new(board: &'a Board) -> Self {
         Self {
             board,
+            // The lowest spawn origin is row 17. The lowest downward kick
+            // moves it to row 15, above any board passing this check.
+            spawn_moves: (board.max_height() <= 15).then(spawn_moves),
             tree: HashMap::with_capacity(500),
             next: Queue(Vec::with_capacity(500)),
             locked: Vec::with_capacity(100),
@@ -275,6 +310,30 @@ impl<'a> Mirai<'a> {
     }
     fn append_air_moves(&mut self, origin: Step, kind: PieceKind) {
         let piece = origin.piece;
+        let column = i16::from(piece.x) - i16::from(AIR_X_MIN);
+        if let Some(table) = self.spawn_moves
+            && piece.y == Piece::spawn(kind).y
+            && let Some(moves) =
+                table[kind as usize][piece.rotation() as usize].get(column as usize)
+        {
+            self.append(
+                origin,
+                moves.shift_left.then(|| piece.shifted(-1, 0)),
+                Instruction::Left,
+                true,
+            );
+            self.append(
+                origin,
+                moves.shift_right.then(|| piece.shifted(1, 0)),
+                Instruction::Right,
+                true,
+            );
+            if kind != PieceKind::O {
+                self.append(origin, moves.rotations[0], Instruction::Cw, true);
+                self.append(origin, moves.rotations[1], Instruction::Ccw, true);
+            }
+            return;
+        }
         self.append(origin, Some(piece.shifted(-1, 0)), Instruction::Left, false);
         self.append(origin, Some(piece.shifted(1, 0)), Instruction::Right, false);
         if kind != PieceKind::O {
@@ -427,6 +486,35 @@ mod tests {
         assert_eq!(path.time, time);
         assert!(target.kind == PieceKind::T || time < 20);
     }
+    #[test]
+    fn cached_spawn_moves_preserve_paths_at_stack_height_cutoff() {
+        let mut board = Board::default();
+        for (y, row) in board.rows[..15].iter_mut().enumerate() {
+            *row = 0b1100111011 >> (y % 3);
+        }
+        for kind in PieceKind::ALL {
+            let spawned = board.spawn(kind).unwrap();
+            let mut cached = Mirai::new(&board);
+            let mut original = Mirai::new(&board);
+            assert!(cached.spawn_moves.is_some());
+            original.spawn_moves = None;
+            cached.generate_full(spawned);
+            original.generate_full(spawned);
+
+            let placements = |mirai: &Mirai<'_>| {
+                mirai
+                    .locked
+                    .iter()
+                    .map(|(p, step)| (*p, step.cost))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(placements(&cached), placements(&original), "{kind}");
+            for (piece, _) in original.locked.iter().copied() {
+                assert_eq!(cached.rebuild(piece, true), original.rebuild(piece, true));
+            }
+        }
+    }
+
     #[test]
     fn original_mirai_generate_empty_o_golden() {
         // Exact fixture from Assets/AI/Tests/MiraiTests.cs GenerateEmptyO.
