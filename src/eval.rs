@@ -393,15 +393,17 @@ pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
         power += w.well_x[well];
     }
 
-    let mut max_diff = 0;
-    // The source intentionally stops before the 8/9 column pair.
-    for x in 0..8 {
-        if x == well || x + 1 == well {
-            continue;
+    if w.max_height_diff != 0 {
+        let mut max_diff = 0;
+        // The source intentionally stops before the 8/9 column pair.
+        for x in 0..8 {
+            if x == well || x + 1 == well {
+                continue;
+            }
+            max_diff = max_diff.max((heights[x + 1] - heights[x]).abs());
         }
-        max_diff = max_diff.max((heights[x + 1] - heights[x]).abs());
+        safety += max_diff * w.max_height_diff;
     }
-    safety += max_diff * w.max_height_diff;
     safety += max_height * w.max_height;
     safety += (max_height - 10).max(0) * w.top50;
     safety += (max_height - 15).max(0) * w.top75;
@@ -409,18 +411,22 @@ pub fn evaluate_board(board: &Board, w: &Weights) -> Value {
     let (cavities, overhangs) = cavities_and_overhangs(&columns, max_height);
     safety += cavities * w.cavities + cavities * cavities * w.cavities_sq;
     safety += overhangs * w.overhangs + overhangs * overhangs * w.overhangs_sq;
-    let (covered, covered_sq) = covered_cells(&clone, &heights);
-    safety += covered * w.covered_cells + covered_sq * w.covered_cells_sq;
+    if w.covered_cells != 0 || w.covered_cells_sq != 0 {
+        let (covered, covered_sq) = covered_cells(&clone, &heights);
+        safety += covered * w.covered_cells + covered_sq * w.covered_cells_sq;
+    }
 
-    let transitions: i32 = clone
-        .rows
-        .iter()
-        .map(|&row| {
-            let row = u32::from(row);
-            ((row | (1 << 10)) ^ (1 | (row << 1))).count_ones() as i32
-        })
-        .sum();
-    safety += transitions * w.row_transitions;
+    if w.row_transitions != 0 {
+        let transitions: i32 = clone
+            .rows
+            .iter()
+            .map(|&row| {
+                let row = u32::from(row);
+                ((row | (1 << 10)) ^ (1 | (row << 1))).count_ones() as i32
+            })
+            .sum();
+        safety += transitions * w.row_transitions;
+    }
     power += floor_log2(clone.ren) * w.downstack;
 
     Value {
