@@ -9,17 +9,20 @@ import statistics
 import subprocess
 import time
 
+from probe_command import check_batch_size, probe_command
+
 
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
-def run(binary, args, output, commands, *, registration, profiling=False):
-    command = [str(binary), *map(str, args)]
+def run(binary, args, output, commands, *, registration, batch_size, profiling=False):
+    command = probe_command(binary, args, batch_size)
     started = time.time()
     process = subprocess.run(command, check=True, capture_output=True, text=True)
     value = json.loads(process.stdout)
+    check_batch_size(value, batch_size)
     if (value["fast_registration"] != registration
             or value["instrumented"] != profiling
             or value["fast_low_stack"] or value["prune_low_stack"]):
@@ -45,10 +48,12 @@ def main():
     parser.add_argument("--baseline-fast-registration", action="store_true",
                         help="Compare against an earlier fast-registration build")
     parser.add_argument("--profile-trials", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Use the same explicit selection count in both builds")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.profile_trials < 1:
-        parser.error("--profile-trials must be positive")
+    if args.profile_trials < 1 or args.batch_size < 1:
+        parser.error("--profile-trials and --batch-size must be positive")
     output = args.output.resolve()
     if (output / "manifest.json").exists():
         parser.error("use a fresh output directory")
@@ -61,6 +66,7 @@ def main():
                 "low_stack_features": "disabled in all variants", "public_seeds": [43001, 43002, 43003],
                 "baseline_fast_registration": args.baseline_fast_registration,
                 "profile_trials": args.profile_trials,
+                "batch_size": args.batch_size,
                 "profile_seeds": [43001 + trial for trial in range(args.profile_trials)]}
     for suffix in ("", "-profile"):
         if manifest["binaries"]["baseline" + suffix]["sha256"] == manifest["binaries"]["candidate" + suffix]["sha256"]:
@@ -81,7 +87,7 @@ def main():
                     pair[variant] = run(binaries[variant], ["--batches", batches, "--threads", threads,
                         "--seed", 43001, "--position", output / "positions" / f"{name}.json"],
                         output / "fixed" / f"{name}-{threads}t-{batches}-{variant}.json", commands,
-                        registration=is_registration(variant))
+                        registration=is_registration(variant), batch_size=args.batch_size)
                 if not same(pair["baseline"], pair["candidate"]):
                     raise RuntimeError("Fixed-work search semantics changed")
                 fixed.append({"position": name, "threads": threads, "batches": batches,
@@ -92,7 +98,7 @@ def main():
             pair = {variant: run(binaries[variant], ["--batches", 128, "--threads", threads,
                 "--seed", 43003, "--max-nodes", cap],
                 output / "caps" / f"{cap}-{threads}t-{variant}.json", commands,
-                registration=is_registration(variant))
+                registration=is_registration(variant), batch_size=args.batch_size)
                 for variant in ("baseline", "candidate")}
             if not same(pair["baseline"], pair["candidate"]):
                 raise RuntimeError("Node-cap behavior changed")
@@ -106,7 +112,7 @@ def main():
                     value = run(binaries[variant], ["--ms", 3000, "--threads", threads,
                         "--seed", 43001 + trial, "--position", output / "positions" / f"{name}.json"],
                         output / "timed" / f"{name}-{threads}t-{trial}-{variant}.json", commands,
-                        registration=is_registration(variant))
+                        registration=is_registration(variant), batch_size=args.batch_size)
                     if value["stats"]["dead"] or value["stats"]["memory_limited"]:
                         raise RuntimeError("Time-limited search died or hit its node cap")
                     pair[variant] = value
@@ -125,7 +131,7 @@ def main():
                     pair[variant] = run(binaries[variant + "-profile"], ["--batches", 512, "--threads", threads,
                         "--seed", 43001 + trial, "--position", output / "positions" / f"{name}.json"],
                         output / "profile" / f"{name}-{threads}t-{trial}-{variant}.json", commands,
-                        registration=is_registration(variant), profiling=True)
+                        registration=is_registration(variant), batch_size=args.batch_size, profiling=True)
                 if not same(pair["baseline"], pair["candidate"]):
                     raise RuntimeError("Profiled fixed-work search semantics changed")
                 profiles.append({"position": name, "threads": threads, "trial": trial,

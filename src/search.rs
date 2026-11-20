@@ -19,6 +19,10 @@ use crate::eval::{Reward, Value, Weights, evaluate_board, evaluate_move};
 use crate::graph_storage::{BoardLookup, board_hash};
 use crate::movegen;
 
+mod continuous;
+mod dirty;
+mod selection;
+
 const NONE: u32 = u32::MAX;
 const KINDS: [PieceKind; 7] = [
     PieceKind::I,
@@ -37,9 +41,10 @@ pub struct Config {
     pub use_hold: bool,
     pub use_speculation: bool,
     pub previews: usize,
-    /// Independent random selections in a batch (Hikari's ParallelCount).
+    /// Selection count for the explicit reference `search_batch` API only.
+    /// Continuous search does not use a batch size.
     pub batch_size: usize,
-    /// Native expansion/evaluation workers, independent of batch_size.
+    /// Native search workers, independent of batch_size.
     pub threads: usize,
     pub seed: u64,
     /// Retained unique nodes, including currently unreachable siblings.
@@ -49,20 +54,25 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        Self::for_threads(1)
+    }
+}
+
+impl Config {
+    /// Configure native search workers. Continuous search has no batch size.
+    pub fn for_threads(threads: usize) -> Self {
         Self {
             max_depth: 32,
             use_hold: true,
             use_speculation: true,
             previews: 12,
             batch_size: 128,
-            threads: 1,
+            threads,
             seed: 1,
             max_nodes: 2_000_000,
         }
     }
-}
 
-impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_depth < 2 {
             return Err("max_depth must allow at least two queue transitions".into());
@@ -89,6 +99,7 @@ pub struct SearchStats {
     /// Legal non-death candidate edges generated before transposition merging.
     pub generated: u64,
     pub transpositions: u64,
+    /// Reference batches completed; continuous search leaves this at zero.
     pub batches: u64,
     pub memory_limited: bool,
     pub dead: bool,
@@ -98,7 +109,9 @@ pub struct SearchStats {
 
 /// Optional profiling counters, accumulated since `start`.
 ///
-/// The five phase wall times are sequential, non-overlapping controller times.
+/// The five phase wall times are non-overlapping controller times. In continuous
+/// parallel search, expansion wall time measures waiting for a completion;
+/// expansion and evaluation worker times overlap controller registration.
 /// Worker times instead sum individual tasks and may exceed wall time when
 /// several threads run concurrently. CPU times exclude descheduling and are
 /// zero on platforms without the optional thread CPU clock.
@@ -106,6 +119,11 @@ pub struct SearchStats {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct ProfileStats {
     pub selection_wall_ns: u64,
+    /// Actual walk time, excluding external queue insertion.
+    pub selection_walk_wall_ns: u64,
+    pub dispatch_wall_ns: u64,
+    pub dispatch_groups: u64,
+    pub dispatch_jobs: u64,
     pub expansion_wall_ns: u64,
     pub registration_wall_ns: u64,
     pub evaluation_wall_ns: u64,
@@ -113,8 +131,9 @@ pub struct ProfileStats {
     /// Controller thread only: excludes parallel selection workers.
     pub selection_cpu_ns: u64,
     pub registration_cpu_ns: u64,
-    /// Controller thread only; covers the full evaluation stage with one worker.
+    /// Controller only; includes candidate evaluation with one worker.
     pub evaluation_cpu_ns: u64,
+    /// Controller thread only: excludes parallel backpropagation workers.
     pub backpropagation_cpu_ns: u64,
     pub expansion_worker_wall_ns: u64,
     pub movegen_worker_wall_ns: u64,
@@ -123,6 +142,9 @@ pub struct ProfileStats {
     pub expansion_count: u64,
     pub movegen_calls: u64,
     pub evaluated_boards: u64,
+    pub evaluation_worker_wall_ns: u64,
+    pub evaluation_worker_cpu_ns: u64,
+    pub evaluated_candidates: u64,
     pub batches: u64,
 }
 
@@ -134,6 +156,8 @@ struct ExpansionProfile {
     movegen_wall_ns: u64,
     movegen_cpu_ns: u64,
     movegen_calls: u64,
+    evaluation_wall_ns: u64,
+    evaluation_cpu_ns: u64,
 }
 
 #[cfg(feature = "profile-search")]
@@ -311,6 +335,203 @@ impl Layer {
     }
 }
 
+const PARALLEL_BACKUP_MIN_NODES: usize = 16;
+const PARALLEL_BACKUP_MIN_EDGES: usize = 8192;
+
+struct BackupJob<'a> {
+    index: u32,
+    children: Children,
+    edges: &'a mut [Edge],
+    value: Option<Value>,
+}
+
+fn propagate_layers(
+    layers: &mut [Layer],
+    updates: &mut [Vec<u32>],
+    pool: Option<&rayon::ThreadPool>,
+) {
+    for depth in (0..updates.len()).rev() {
+        updates[depth].sort_unstable();
+        updates[depth].dedup();
+        if updates[depth].is_empty() {
+            continue;
+        }
+        let (before, after) = layers.split_at_mut(depth + 1);
+        let current = &mut before[depth];
+        let backup_children = |&index: &u32| {
+            let node = current.nodes[index as usize];
+            (!node.dead).then_some(node.children).flatten()
+        };
+        let parallel = pool.is_some()
+            && updates[depth].len() >= PARALLEL_BACKUP_MIN_NODES
+            && updates[depth]
+                .iter()
+                .filter_map(backup_children)
+                .map(|children| children.lengths.iter().map(|&n| n as usize).sum::<usize>())
+                .sum::<usize>()
+                >= PARALLEL_BACKUP_MIN_EDGES;
+        if parallel {
+            let mut descriptors: Vec<_> = updates[depth]
+                .iter()
+                .filter_map(|&index| {
+                    backup_children(&index).map(|children| {
+                        let length = children.lengths.iter().map(|&n| n as usize).sum::<usize>();
+                        (index, children, length)
+                    })
+                })
+                .collect();
+            // Node IDs follow insertion order, but expansions can append their
+            // edges in a different order. Split in edge order so all mutable
+            // ranges are disjoint, without copying or locking graph storage.
+            // Empty ranges at an append boundary precede a nonempty range
+            // starting there, so they do not overlap the remaining tail.
+            descriptors.sort_unstable_by_key(|(_, children, length)| (children.start, *length));
+            let mut jobs = Vec::with_capacity(descriptors.len());
+            let mut tail = current.edges.as_mut_slice();
+            let mut offset = 0;
+            for (index, children, length) in descriptors {
+                let start = children.start as usize;
+                let (_, after_gap) = tail.split_at_mut(start - offset);
+                let (edges, rest) = after_gap.split_at_mut(length);
+                jobs.push(BackupJob {
+                    index,
+                    children,
+                    edges,
+                    value: None,
+                });
+                tail = rest;
+                offset = start + length;
+            }
+            let child_nodes = &after[0].nodes;
+            // Keep one coarse chunk on the controller and spawn at most
+            // three chunks into the existing pool, then join this layer.
+            let pool = pool.expect("parallel backup requires a worker pool");
+            let chunk_count = pool.current_num_threads().min(4);
+            let chunk_size = jobs.len().div_ceil(chunk_count).max(2);
+            let mut chunks = jobs.chunks_mut(chunk_size);
+            let first = chunks
+                .next()
+                .expect("parallel backup requires live children");
+            pool.in_place_scope(|scope| {
+                for chunk in chunks {
+                    scope.spawn(move |_| {
+                        for job in chunk {
+                            job.value = backup_edges(job.children, job.edges, child_nodes);
+                        }
+                    });
+                }
+                for job in first {
+                    job.value = backup_edges(job.children, job.edges, child_nodes);
+                }
+            });
+            for job in jobs {
+                apply_backup(&mut current.nodes[job.index as usize], job.value);
+            }
+        } else {
+            for &index in &updates[depth] {
+                let node = current.nodes[index as usize];
+                if node.dead {
+                    continue;
+                }
+                let Some(children) = node.children else {
+                    continue;
+                };
+                let start = children.start as usize;
+                let length = children.lengths.iter().map(|&n| n as usize).sum::<usize>();
+                let value = backup_edges(
+                    children,
+                    &mut current.edges[start..start + length],
+                    &after[0].nodes,
+                );
+                apply_backup(&mut current.nodes[index as usize], value);
+            }
+        }
+        // Dead and unexpanded nodes also propagate to every incoming parent.
+        // Keep this after the parallel join: shallower layers must observe all
+        // of the child values from this layer, as in Hikari's layer barrier.
+        if depth > 0 {
+            for offset in 0..updates[depth].len() {
+                let index = updates[depth][offset];
+                let mut link = current.nodes[index as usize].parent_head;
+                while link != NONE {
+                    let parent = current.parents[link as usize];
+                    updates[depth - 1].push(parent.parent);
+                    link = parent.next;
+                }
+            }
+        }
+    }
+}
+
+fn apply_backup(node: &mut Node, value: Option<Value>) {
+    if let Some(value) = value {
+        node.value = value;
+    } else {
+        node.dead = true;
+    }
+}
+
+fn backup_edges(children: Children, edges: &mut [Edge], child_nodes: &[Node]) -> Option<Value> {
+    let mut sum = [0_i32; 4];
+    let mut spike = 0;
+    let mut count = 0_i32;
+    let mut dead = false;
+    for kind in KINDS {
+        if children.possibilities & (1 << kind as u8) == 0 {
+            continue;
+        }
+        let range = children.range(kind);
+        let edges =
+            &mut edges[range.start - children.start as usize..range.end - children.start as usize];
+        edges.sort_unstable_by(|a, b| {
+            let a_node = &child_nodes[a.node as usize];
+            let b_node = &child_nodes[b.node as usize];
+            a_node.dead.cmp(&b_node.dead).then_with(|| {
+                b_node
+                    .value
+                    .with_reward(b.reward)
+                    .score()
+                    .cmp(&a_node.value.with_reward(a.reward).score())
+            })
+        });
+        // Alive edges are first and their scores are descending. The first
+        // one is therefore the strict-score winner, including the reference's
+        // tie choice after the same unstable sort. Only spike can improve on
+        // a later edge; do not recompute both scores for every candidate.
+        let best = edges.first().and_then(|edge| {
+            let child = &child_nodes[edge.node as usize];
+            (!child.dead).then(|| child.value.with_reward(edge.reward))
+        });
+        if let Some(mut value) = best {
+            for edge in edges.iter().skip(1) {
+                let child = &child_nodes[edge.node as usize];
+                if child.dead {
+                    break;
+                }
+                let candidate_spike = if edge.reward.attack < 0 {
+                    0
+                } else {
+                    child.value.spike.wrapping_add(edge.reward.attack)
+                };
+                value.spike = value.spike.max(candidate_spike);
+            }
+            for (total, component) in sum.iter_mut().zip(value.value) {
+                *total = total.wrapping_add(component);
+            }
+            spike = spike.max(value.spike);
+            count += 1;
+        } else {
+            // Hikari rejects a speculative node if any possible draw has no
+            // surviving response, rather than averaging away death.
+            dead = true;
+        }
+    }
+    (!dead && count != 0).then(|| Value {
+        value: sum.map(|component| component / count),
+        spike,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct Selected {
     depth: usize,
@@ -337,8 +558,18 @@ struct Expansion {
     edges: Vec<PlannedEdge>,
     lengths: [u16; 7],
     dead: bool,
+    /// Continuous workers evaluate candidates before publishing any graph edge.
+    evaluations: Option<Vec<Value>>,
     #[cfg(feature = "profile-search")]
     profile: ExpansionProfile,
+}
+
+#[derive(Default)]
+struct RegistrationScratch {
+    edge_capacity: Vec<usize>,
+    update_capacity: Vec<usize>,
+    updates: Vec<Vec<u32>>,
+    evaluations: Vec<(usize, u32, Board)>,
 }
 
 #[derive(Clone, Copy)]
@@ -393,6 +624,8 @@ pub struct Search {
     started: bool,
     root_can_hold: bool,
     select_guidance: Vec<Option<Piece>>,
+    stream: continuous::Stream,
+    registration: RegistrationScratch,
 }
 
 impl Search {
@@ -410,6 +643,7 @@ impl Search {
             )
         };
         let rng = Random::new(config.seed);
+        let stream = continuous::Stream::new(weights);
         Ok(Self {
             config,
             weights,
@@ -427,12 +661,15 @@ impl Search {
             started: false,
             root_can_hold: true,
             select_guidance: Vec::new(),
+            stream,
+            registration: RegistrationScratch::default(),
         })
     }
 
     /// Explicitly replace the position. Ordinary committed moves use commit,
     /// which rotates one layer and preserves all the deeper layers.
     pub fn start(&mut self, board: Board, queue: Vec<PieceKind>) {
+        self.cancel_stream();
         self.board = board;
         self.queue.clear();
         self.pending = queue.into();
@@ -458,6 +695,7 @@ impl Search {
     /// bag. Pure added garbage translates the previous plan into selectGuidance,
     /// as in ResetInternal; other board edits discard the guidance.
     pub fn reset(&mut self, mut board: Board) {
+        self.cancel_stream();
         let previous_height = self.board.max_height();
         let next_height = board.max_height();
         let previous_plan = self.current_plan();
@@ -537,6 +775,7 @@ impl Search {
     }
 
     fn resolve(&mut self, depth: usize, kind: PieceKind) {
+        self.cancel_stream();
         if depth >= self.layers.len() {
             return;
         }
@@ -559,6 +798,8 @@ impl Search {
     /// deduplicates selected leaves, expands them, then backs up all parents.
     /// Returns the number of leaves actually expanded.
     pub fn search_batch(&mut self) -> usize {
+        // Reference and continuous work cannot reserve the same leaf.
+        self.pause();
         if !self.started
             || self.queue.is_empty()
             || self.counters.memory_limited
@@ -626,8 +867,18 @@ impl Search {
         {
             self.profile.expansion_wall_ns += expansion_clock.elapsed().as_nanos() as u64;
         }
+        self.register_expansions(expansions, false)
+    }
+
+    fn register_expansions(&mut self, expansions: Vec<Expansion>, changed_only: bool) -> usize {
         #[cfg(feature = "profile-search")]
         let registration_clock = ProfileClock::start();
+        let RegistrationScratch {
+            mut edge_capacity,
+            mut update_capacity,
+            mut updates,
+            mut evaluations,
+        } = std::mem::take(&mut self.registration);
         #[cfg(feature = "profile-search")]
         for expansion in &expansions {
             self.profile.expansion_worker_wall_ns += expansion.profile.expansion_wall_ns;
@@ -636,15 +887,19 @@ impl Search {
             self.profile.movegen_worker_cpu_ns += expansion.profile.movegen_cpu_ns;
             self.profile.movegen_calls += expansion.profile.movegen_calls;
             self.profile.expansion_count += 1;
+            self.profile.evaluation_worker_wall_ns += expansion.profile.evaluation_wall_ns;
+            self.profile.evaluation_worker_cpu_ns += expansion.profile.evaluation_cpu_ns;
+            self.profile.evaluated_candidates +=
+                expansion.evaluations.as_ref().map_or(0, |v| v.len()) as u64;
         }
         self.counters.generated += expansions
             .iter()
             .map(|expansion| expansion.edges.len() as u64)
             .sum::<u64>();
 
-        let required_layers = selections
+        let required_layers = expansions
             .iter()
-            .map(|selected| selected.depth + 2)
+            .map(|expansion| expansion.selected.depth + 2)
             .max()
             .unwrap_or(1);
         while self.layers.len() < required_layers {
@@ -655,8 +910,10 @@ impl Search {
         // writing any graph records, so Vec growth does not repeatedly copy the
         // large Board evaluation records or densely packed graph arrays.
         let layers = self.layers.make_contiguous();
-        let mut edge_capacity = vec![0; layers.len()];
-        let mut update_capacity = vec![0; layers.len()];
+        edge_capacity.clear();
+        edge_capacity.resize(layers.len(), 0);
+        update_capacity.clear();
+        update_capacity.resize(layers.len(), 0);
         for expansion in &expansions {
             let depth = expansion.selected.depth;
             update_capacity[depth] += 1;
@@ -667,11 +924,22 @@ impl Search {
         let mut node_count = layers.iter().map(|layer| layer.nodes.len()).sum::<usize>();
         let remaining_nodes = self.config.max_nodes - node_count;
         let candidates = edge_capacity.iter().sum::<usize>();
-        let mut evaluations = Vec::with_capacity(candidates.min(remaining_nodes));
-        let mut updates: Vec<Vec<u32>> = update_capacity
-            .into_iter()
-            .map(Vec::with_capacity)
-            .collect();
+        let evaluation_capacity = if expansions
+            .iter()
+            .any(|expansion| expansion.evaluations.is_none() && !expansion.dead)
+        {
+            candidates.min(remaining_nodes)
+        } else {
+            0
+        };
+        evaluations.clear();
+        evaluations.reserve(evaluation_capacity);
+        updates.resize_with(layers.len(), Vec::new);
+        updates.truncate(layers.len());
+        for (update, &capacity) in updates.iter_mut().zip(&update_capacity) {
+            update.clear();
+            update.reserve(capacity);
+        }
         for depth in 0..layers.len() {
             layers[depth].edges.reserve(edge_capacity[depth]);
             if depth > 0 {
@@ -688,6 +956,11 @@ impl Search {
 
         for expansion in expansions {
             let selected = expansion.selected;
+            if changed_only {
+                self.stream
+                    .reserved
+                    .remove(&(selected.depth, selected.node));
+            }
             if expansion.dead {
                 layers[selected.depth].nodes[selected.node as usize].dead = true;
                 updates[selected.depth].push(selected.node);
@@ -779,8 +1052,16 @@ impl Search {
                     planned.piece.is_none(),
                 );
                 if fresh {
-                    evaluations.push((selected.depth + 1, node, planned.board));
+                    if let Some(values) = &expansion.evaluations {
+                        child_layer.nodes[node as usize].value = values[candidate];
+                    } else {
+                        evaluations.push((selected.depth + 1, node, planned.board));
+                    }
                     node_count += 1;
+                    #[cfg(feature = "profile-search")]
+                    {
+                        self.profile.evaluated_boards += 1;
+                    }
                 } else {
                     self.counters.transpositions += 1;
                 }
@@ -805,7 +1086,6 @@ impl Search {
             let (wall, cpu) = registration_clock.elapsed();
             self.profile.registration_wall_ns += wall;
             self.profile.registration_cpu_ns += cpu;
-            self.profile.evaluated_boards += evaluations.len() as u64;
         }
         #[cfg(feature = "profile-search")]
         let evaluation_clock = ProfileClock::start();
@@ -815,7 +1095,9 @@ impl Search {
         let evaluate = |&(depth, node, board): &(usize, u32, Board)| {
             (depth, node, evaluate_board(&board, &self.weights))
         };
-        let values: Vec<_> = if let Some(pool) = &self.pool {
+        let values: Vec<_> = if evaluations.is_empty() {
+            Vec::new()
+        } else if let Some(pool) = &self.pool {
             pool.install(|| evaluations.par_iter().map(evaluate).collect())
         } else {
             evaluations.iter().map(evaluate).collect()
@@ -832,20 +1114,39 @@ impl Search {
         #[cfg(feature = "profile-search")]
         let backpropagation_clock = ProfileClock::start();
         self.counters.expanded += expanded as u64;
-        self.propagate(updates);
+        if changed_only {
+            dirty::propagate_changed_with_scratch(
+                self.layers.make_contiguous(),
+                &mut updates,
+                self.pool.as_ref(),
+                &mut self.stream.dirty,
+            );
+        } else {
+            propagate_layers(
+                self.layers.make_contiguous(),
+                &mut updates,
+                self.pool.as_ref(),
+            );
+        }
         #[cfg(feature = "profile-search")]
         {
             let (wall, cpu) = backpropagation_clock.elapsed();
             self.profile.backpropagation_wall_ns += wall;
             self.profile.backpropagation_cpu_ns += cpu;
         }
+        self.registration = RegistrationScratch {
+            edge_capacity,
+            update_capacity,
+            updates,
+            evaluations,
+        };
         expanded
     }
 
     pub fn think(&mut self, duration: Duration) {
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline {
-            if self.search_batch() == 0
+            if self.search_step() == 0
                 && (!self.started
                     || self.queue.is_empty()
                     || self.counters.memory_limited
@@ -854,9 +1155,30 @@ impl Search {
                 break;
             }
         }
+        self.pause();
     }
 
     fn select(&self, rng: &mut Random, guided: bool) -> Option<Selected> {
+        self.select_using(rng, guided, pick_ranked)
+    }
+
+    fn select_cached(
+        &self,
+        rng: &mut Random,
+        guided: bool,
+        scratch: &mut [f32; 255],
+    ) -> Option<Selected> {
+        self.select_using(rng, guided, |edges, children, rng| {
+            selection::pick_ranked_cached(edges, children, rng, scratch)
+        })
+    }
+
+    fn select_using(
+        &self,
+        rng: &mut Random,
+        guided: bool,
+        mut pick: impl FnMut(&[Edge], &Layer, &mut Random) -> usize,
+    ) -> Option<Selected> {
         let mut board = self.board;
         let mut index = self.root;
         let mut can_hold = self.root_can_hold;
@@ -898,7 +1220,7 @@ impl Search {
             } else {
                 None
             }
-            .unwrap_or_else(|| pick_ranked(edges, child_layer, rng));
+            .unwrap_or_else(|| pick(edges, child_layer, rng));
             let child = edges.get(picked)?;
             // Keep original semantics: draw consumption happens on the path,
             // not in the dedup/evaluation key produced by ExpandJob.
@@ -910,88 +1232,12 @@ impl Search {
     }
 
     fn propagate(&mut self, mut updates: Vec<Vec<u32>>) {
-        for depth in (0..updates.len()).rev() {
-            updates[depth].sort_unstable();
-            updates[depth].dedup();
-            for offset in 0..updates[depth].len() {
-                let index = updates[depth][offset];
-                self.backup(depth, index);
-                if depth > 0 {
-                    let layer = &self.layers[depth];
-                    let mut link = layer.nodes[index as usize].parent_head;
-                    while link != NONE {
-                        let parent = layer.parents[link as usize];
-                        updates[depth - 1].push(parent.parent);
-                        link = parent.next;
-                    }
-                }
-            }
-        }
-    }
-
-    fn backup(&mut self, depth: usize, index: u32) {
-        let node = self.layers[depth].nodes[index as usize];
-        if node.dead {
-            return;
-        }
-        let Some(children) = node.children else {
-            return;
-        };
-        let mut sum = [0_i32; 4];
-        let mut spike = 0;
-        let mut count = 0_i32;
-        let mut dead = false;
         // VecDeque's backing storage may wrap after an advance. Using separate
         // slices here keeps the two mutable/immutable layer borrows disjoint.
         let layers = self.layers.make_contiguous();
-        let (before, after) = layers.split_at_mut(depth + 1);
-        let current = &mut before[depth];
-        let child_layer = &after[0];
-        for kind in KINDS {
-            if children.possibilities & (1 << kind as u8) == 0 {
-                continue;
-            }
-            let edges = &mut current.edges[children.range(kind)];
-            edges.sort_unstable_by(|a, b| {
-                let a_node = &child_layer.nodes[a.node as usize];
-                let b_node = &child_layer.nodes[b.node as usize];
-                a_node.dead.cmp(&b_node.dead).then_with(|| {
-                    b_node
-                        .value
-                        .with_reward(b.reward)
-                        .score()
-                        .cmp(&a_node.value.with_reward(a.reward).score())
-                })
-            });
-            let mut best: Option<Value> = None;
-            for edge in edges.iter() {
-                let child = child_layer.nodes[edge.node as usize];
-                if !child.dead {
-                    let value = child.value.with_reward(edge.reward);
-                    best = Some(best.map_or(value, |previous| previous.improve(value)));
-                }
-            }
-            if let Some(value) = best {
-                for (total, component) in sum.iter_mut().zip(value.value) {
-                    *total = total.wrapping_add(component);
-                }
-                spike = spike.max(value.spike);
-                count += 1;
-            } else {
-                // Hikari rejects a speculative node if any possible draw has
-                // no surviving response, rather than averaging away death.
-                dead = true;
-            }
-        }
-        let node = &mut current.nodes[index as usize];
-        if dead || count == 0 {
-            node.dead = true;
-        } else {
-            node.value = Value {
-                value: sum.map(|component| component / count),
-                spike,
-            };
-        }
+        // Serial layer preparation stays on the controller. Only independent
+        // edge backups enter the worker pool, with a barrier before parents.
+        propagate_layers(layers, &mut updates, self.pool.as_ref());
     }
 
     pub fn best_move(&self) -> Option<ChosenMove> {
@@ -1094,10 +1340,27 @@ impl Search {
         self.commit(chosen.piece)
     }
 
+    fn ensure_root_expanded(&mut self) {
+        if self.layers[0].nodes[self.root as usize].children.is_none() && self.can_expand_root() {
+            let seed = self.rng.next();
+            if let Some(selected) = self.select(&mut Random(seed), true) {
+                let expansion = continuous::prepare(selected, self.config.use_hold, &self.weights);
+                self.register_expansions(vec![expansion], true);
+            }
+        }
+    }
+
+    fn can_expand_root(&self) -> bool {
+        !self.queue.is_empty()
+            && !self.counters.memory_limited
+            && !self.layers[0].nodes[self.root as usize].dead
+    }
+
     /// Confirm a complete physical placement, including its implicit empty
     /// hold. Both transitions are validated before changing board or queue.
     /// Failed validation may expand the graph, but cannot partly commit a hold.
     pub fn commit_physical(&mut self, piece: Piece) -> Result<(), String> {
+        self.cancel_stream();
         if !self.started {
             return Err("start must be called before committing a move".into());
         }
@@ -1112,7 +1375,7 @@ impl Search {
             return Err("piece is not available after an empty hold".into());
         }
         if self.layers[0].nodes[self.root as usize].children.is_none() {
-            self.search_batch();
+            self.ensure_root_expanded();
         }
         let children = self.layers[0].nodes[self.root as usize]
             .children
@@ -1128,13 +1391,18 @@ impl Search {
             }
             let mut board = self.board;
             apply_transition(&mut board, current, None);
-            self.expand_selections(vec![Selected {
-                depth: 1,
-                node: hold.node,
-                board,
-                can_hold: false,
-                candidates: 1 << piece.kind as u8,
-            }]);
+            let expansion = continuous::prepare(
+                Selected {
+                    depth: 1,
+                    node: hold.node,
+                    board,
+                    can_hold: false,
+                    candidates: 1 << piece.kind as u8,
+                },
+                self.config.use_hold,
+                &self.weights,
+            );
+            self.register_expansions(vec![expansion], true);
         }
         let held_children = self.layers[1].nodes[hold.node as usize]
             .children
@@ -1154,13 +1422,14 @@ impl Search {
     /// Only the consumed layer is cleared; descendants and transpositions keep
     /// their indices, evaluations, children, and multiple parent links.
     pub fn commit(&mut self, piece: Option<Piece>) -> Result<(), String> {
+        self.cancel_stream();
         if !self.started {
             return Err("start must be called before committing a move".into());
         }
         // A protocol client can confirm the second half of an empty-hold move
         // immediately. Expand that new root before looking up the placement.
         if self.layers[0].nodes[self.root as usize].children.is_none() {
-            self.search_batch();
+            self.ensure_root_expanded();
         }
         let &kind = self
             .queue
@@ -1249,6 +1518,7 @@ fn make_expansion(selected: Selected, use_hold: bool, weights: &Weights) -> Expa
         edges: Vec::new(),
         lengths: [0; 7],
         dead: false,
+        evaluations: None,
         #[cfg(feature = "profile-search")]
         profile: ExpansionProfile::default(),
     };
@@ -1414,6 +1684,387 @@ fn pick_ranked(edges: &[Edge], children: &Layer, rng: &mut Random) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // Insert inside src/search.rs's existing #[cfg(test)] mod tests.
+    // The reference intentionally keeps the original node-at-a-time algorithm.
+
+    fn original_serial_propagate(search: &mut Search, mut updates: Vec<Vec<u32>>) {
+        for depth in (0..updates.len()).rev() {
+            updates[depth].sort_unstable();
+            updates[depth].dedup();
+            for offset in 0..updates[depth].len() {
+                let index = updates[depth][offset];
+                let node = search.layers[depth].nodes[index as usize];
+                if !node.dead
+                    && let Some(children) = node.children
+                {
+                    let mut sum = [0_i32; 4];
+                    let mut spike = 0;
+                    let mut count = 0_i32;
+                    let mut dead = false;
+                    let layers = search.layers.make_contiguous();
+                    let (before, after) = layers.split_at_mut(depth + 1);
+                    let current = &mut before[depth];
+                    let child_layer = &after[0];
+                    for kind in KINDS {
+                        if children.possibilities & (1 << kind as u8) == 0 {
+                            continue;
+                        }
+                        let edges = &mut current.edges[children.range(kind)];
+                        edges.sort_unstable_by(|a, b| {
+                            let a_node = &child_layer.nodes[a.node as usize];
+                            let b_node = &child_layer.nodes[b.node as usize];
+                            a_node.dead.cmp(&b_node.dead).then_with(|| {
+                                b_node
+                                    .value
+                                    .with_reward(b.reward)
+                                    .score()
+                                    .cmp(&a_node.value.with_reward(a.reward).score())
+                            })
+                        });
+                        let mut best: Option<Value> = None;
+                        for edge in edges.iter() {
+                            let child = child_layer.nodes[edge.node as usize];
+                            if !child.dead {
+                                let value = child.value.with_reward(edge.reward);
+                                best = Some(best.map_or(value, |previous| previous.improve(value)));
+                            }
+                        }
+                        if let Some(value) = best {
+                            for (total, component) in sum.iter_mut().zip(value.value) {
+                                *total = total.wrapping_add(component);
+                            }
+                            spike = spike.max(value.spike);
+                            count += 1;
+                        } else {
+                            dead = true;
+                        }
+                    }
+                    let node = &mut current.nodes[index as usize];
+                    if dead || count == 0 {
+                        node.dead = true;
+                    } else {
+                        node.value = Value {
+                            value: sum.map(|component| component / count),
+                            spike,
+                        };
+                    }
+                }
+                if depth > 0 {
+                    let layer = &search.layers[depth];
+                    let mut link = layer.nodes[index as usize].parent_head;
+                    while link != NONE {
+                        let parent = layer.parents[link as usize];
+                        updates[depth - 1].push(parent.parent);
+                        link = parent.next;
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_same_graph(a: &Search, b: &Search) {
+        assert_eq!(a.board, b.board);
+        assert_eq!(a.queue, b.queue);
+        assert_eq!(a.pending, b.pending);
+        assert_eq!(a.root, b.root);
+        assert_eq!(a.rng.0, b.rng.0);
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.root_can_hold, b.root_can_hold);
+        assert_eq!(a.select_guidance, b.select_guidance);
+        assert_eq!(a.started, b.started);
+        assert_eq!(
+            serde_json::to_value(a.stats()).unwrap(),
+            serde_json::to_value(b.stats()).unwrap()
+        );
+        assert_eq!(a.current_plan(), b.current_plan());
+        let moves = |search: &Search| {
+            search
+                .ranked_moves()
+                .into_iter()
+                .map(|m| (m.piece, m.hold, m.value, m.time, m.epoch))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(moves(a), moves(b));
+        assert_eq!(a.layers.len(), b.layers.len());
+        for (depth, (a, b)) in a.layers.iter().zip(&b.layers).enumerate() {
+            assert_eq!(a.nodes.len(), b.nodes.len(), "nodes at depth {depth}");
+            for (index, (a, b)) in a.nodes.iter().zip(&b.nodes).enumerate() {
+                assert_eq!(a.value, b.value, "value at {depth}:{index}");
+                assert_eq!(a.dead, b.dead, "death at {depth}:{index}");
+                assert_eq!(a.parent_head, b.parent_head, "head at {depth}:{index}");
+                let metadata =
+                    |c: Option<Children>| c.map(|c| (c.start, c.lengths, c.possibilities));
+                assert_eq!(
+                    metadata(a.children),
+                    metadata(b.children),
+                    "children at {depth}:{index}"
+                );
+            }
+            assert_eq!(a.edges.len(), b.edges.len(), "edges at depth {depth}");
+            for (index, (a, b)) in a.edges.iter().zip(&b.edges).enumerate() {
+                assert_eq!(
+                    (a.node, a.piece, a.reward, a.time),
+                    (b.node, b.piece, b.reward, b.time),
+                    "ordered edge at {depth}:{index}"
+                );
+            }
+            assert_eq!(a.parents.len(), b.parents.len(), "parents at depth {depth}");
+            for (a, b) in a.parents.iter().zip(&b.parents) {
+                assert_eq!((a.parent, a.next), (b.parent, b.next));
+            }
+            assert_eq!(a.lookup.keys().count(), b.lookup.keys().count());
+            for board in a.lookup.keys() {
+                assert_eq!(a.lookup.get(board), b.lookup.get(board));
+            }
+        }
+    }
+
+    fn randomized_backprop_fixture(
+        threads: usize,
+        seed: u64,
+        wrapped: bool,
+    ) -> (Search, Vec<Vec<u32>>) {
+        let mut search = Search::new(
+            Config {
+                threads,
+                ..Config::default()
+            },
+            Weights::default(),
+        )
+        .unwrap();
+        search.start(Board::default(), vec![PieceKind::I]);
+        let widths = [83_usize, 131, 197, 271];
+        let mut random = Random::new(seed);
+        let mut layers = widths.map(|width| Layer {
+            nodes: (0..width)
+                .map(|index| {
+                    // Equal scores with distinct components/spikes exercise unstable-sort ties.
+                    let lane = (index % 11) as i32;
+                    let mut node = Node::new(Value {
+                        value: [lane, -lane, (random.next() % 5) as i32, i32::MAX],
+                        spike: (random.next() % 41) as i32,
+                    });
+                    node.dead = index % 29 == 0;
+                    node
+                })
+                .collect(),
+            ..Layer::default()
+        });
+        for depth in 0..layers.len() - 1 {
+            let (before, after) = layers.split_at_mut(depth + 1);
+            let current = &mut before[depth];
+            let child_layer = &mut after[0];
+            let mut order: Vec<_> = (0..current.nodes.len()).collect();
+            for end in (1..order.len()).rev() {
+                order.swap(end, random.next() as usize % (end + 1));
+            }
+            for index in order {
+                if index % 13 == 0 {
+                    continue; // An unexpanded leaf in a populated layer.
+                }
+                let start = current.edges.len() as u32;
+                let possibilities = match index % 23 {
+                    0 => 0,
+                    1 => 1 << (index % 7),
+                    _ => (random.next() % 127 + 1) as u8,
+                };
+                let mut lengths = [0_u16; 7];
+                for (kind, length) in lengths.iter_mut().enumerate() {
+                    // Both truly empty children and a missing speculative draw occur.
+                    if index % 23 <= 1 || (index % 19 == 0 && kind == index % 7) {
+                        continue;
+                    }
+                    *length = 128 + (random.next() % 17) as u16;
+                    for offset in 0..*length {
+                        let child = random.next() as usize % child_layer.nodes.len();
+                        let node = &mut child_layer.nodes[child];
+                        let next = node.parent_head;
+                        node.parent_head = child_layer.parents.len() as u32;
+                        child_layer.parents.push(ParentLink {
+                            parent: index as u32,
+                            next,
+                        });
+                        current.edges.push(Edge {
+                            node: child as u32,
+                            piece: (offset % 9 != 0).then_some(Piece::new(
+                                KINDS[kind],
+                                (offset % 10) as i8,
+                                (index % 24) as i8,
+                                (offset % 4) as u8,
+                            )),
+                            reward: Reward {
+                                evaluation: (random.next() % 7) as i32 - 3,
+                                attack: (random.next() % 7) as i32 - 1,
+                            },
+                            time: (random.next() % 91) as i32,
+                        });
+                    }
+                }
+                current.nodes[index].children = Some(Children {
+                    start,
+                    lengths,
+                    possibilities,
+                });
+            }
+            // This fixture must enter the actual parallel path, not only compare fallbacks.
+            let eligible = current
+                .nodes
+                .iter()
+                .filter(|n| !n.dead && n.children.is_some())
+                .count();
+            assert!(eligible >= PARALLEL_BACKUP_MIN_NODES);
+            let edges = current
+                .nodes
+                .iter()
+                .filter(|n| !n.dead)
+                .filter_map(|n| n.children)
+                .map(|c| {
+                    c.lengths
+                        .iter()
+                        .map(|&length| length as usize)
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+            assert!(edges >= PARALLEL_BACKUP_MIN_EDGES);
+            let starts: Vec<_> = current
+                .nodes
+                .iter()
+                .filter_map(|n| n.children.map(|c| c.start))
+                .collect();
+            assert!(starts.windows(2).any(|p| p[0] > p[1]));
+        }
+        let mut updates: Vec<Vec<u32>> = widths
+            .iter()
+            .map(|&width| {
+                // Deliberately unsorted, repeated updates with multiple shared parents.
+                (0..width)
+                    .rev()
+                    .flat_map(|index| [index as u32, index as u32])
+                    .collect()
+            })
+            .collect();
+        // Repeating the last leaf ensures deduplication also occurs before parent fan-out.
+        updates.last_mut().unwrap().extend([0, 0, 1, 1]);
+        if wrapped {
+            let mut layers: Vec<_> = layers.into_iter().collect();
+            let last = layers.pop().unwrap();
+            let mut deque = VecDeque::with_capacity(widths.len());
+            deque.push_back(last);
+            deque.extend(layers);
+            let last = deque.pop_front().unwrap();
+            deque.push_back(last);
+            assert!(!deque.as_slices().1.is_empty());
+            search.layers = deque;
+        } else {
+            search.layers = layers.into_iter().collect();
+        }
+        (search, updates)
+    }
+
+    #[test]
+    fn parallel_backprop_matches_original_for_shared_speculative_graphs() {
+        for (threads, seed, wrapped) in [
+            (2, 33, false),
+            (4, 57, false),
+            (8, 91, true),
+            (12, 120, true),
+        ] {
+            let (mut expected, updates) = randomized_backprop_fixture(1, seed, wrapped);
+            let (mut actual, _) = randomized_backprop_fixture(threads, seed, wrapped);
+            original_serial_propagate(&mut expected, updates.clone());
+            actual.propagate(updates);
+            assert_same_graph(&expected, &actual);
+            // Repeat on the sorted graph: updates of already dead nodes still reach every parent.
+            let updates: Vec<_> = actual
+                .layers
+                .iter()
+                .map(|l| (0..l.nodes.len() as u32).rev().collect())
+                .collect();
+            original_serial_propagate(&mut expected, updates.clone());
+            actual.propagate(updates);
+            assert_same_graph(&expected, &actual);
+        }
+    }
+
+    #[test]
+    fn parallel_batches_keep_full_graph_at_caps_and_after_advance() {
+        for (threads, cap) in [(4, 2), (8, 2_000), (12, 10_000)] {
+            let config = Config {
+                max_nodes: cap,
+                batch_size: 32,
+                previews: 2,
+                seed: 350 + cap as u64,
+                ..Config::default()
+            };
+            let mut serial = Search::new(config.clone(), Weights::default()).unwrap();
+            let mut parallel =
+                Search::new(Config { threads, ..config }, Weights::default()).unwrap();
+            let mut board = Board::default();
+            for (y, hole) in [2, 3, 7, 7].into_iter().enumerate() {
+                board.rows[y] = 0x3ff ^ (1 << hole);
+            }
+            let queue = vec![
+                PieceKind::T,
+                PieceKind::O,
+                PieceKind::I,
+                PieceKind::J,
+                PieceKind::L,
+                PieceKind::S,
+            ];
+            serial.start(board, queue.clone());
+            parallel.start(board, queue);
+            for _ in 0..64 {
+                assert_eq!(serial.search_batch(), parallel.search_batch());
+                assert_same_graph(&serial, &parallel);
+                if serial.stats().memory_limited {
+                    break;
+                }
+            }
+            assert!(serial.stats().memory_limited, "cap {cap} must be exercised");
+            if let Some(chosen) = serial.best_move() {
+                serial.advance(&chosen).unwrap();
+                parallel.advance(&chosen).unwrap();
+                assert_same_graph(&serial, &parallel);
+                for _ in 0..4 {
+                    assert_eq!(serial.search_batch(), parallel.search_batch());
+                    assert_same_graph(&serial, &parallel);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_backprop_leaves_unupdated_edge_spans_untouched() {
+        let (mut expected, _) = randomized_backprop_fixture(1, 65, true);
+        let (mut actual, _) = randomized_backprop_fixture(8, 65, true);
+        let mut updates = vec![Vec::new(); actual.layers.len()];
+        updates[0] = (0..actual.layers[0].nodes.len() as u32)
+            .rev()
+            .filter(|index| index % 3 != 0)
+            .collect();
+        let nodes: Vec<_> = updates[0]
+            .iter()
+            .map(|&index| actual.layers[0].nodes[index as usize])
+            .filter(|node| !node.dead && node.children.is_some())
+            .collect();
+        assert!(nodes.len() >= PARALLEL_BACKUP_MIN_NODES);
+        let edges = nodes
+            .iter()
+            .map(|node| {
+                node.children
+                    .unwrap()
+                    .lengths
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert!(edges >= PARALLEL_BACKUP_MIN_EDGES);
+        original_serial_propagate(&mut expected, updates.clone());
+        actual.propagate(updates);
+        assert_same_graph(&expected, &actual);
+    }
+
     use super::*;
 
     fn search() -> Search {
@@ -2087,3 +2738,6 @@ mod tests {
         assert!(search.select_guidance.is_empty());
     }
 }
+
+#[cfg(test)]
+mod backup_tests;

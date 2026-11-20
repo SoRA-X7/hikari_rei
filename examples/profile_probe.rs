@@ -9,13 +9,21 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
+#[command(group(clap::ArgGroup::new("reference_mode").args(["batches", "reference_batches"])))]
 struct Args {
     #[arg(long, default_value_t = 3000)]
     ms: u64,
+    /// Run a fixed number of reference search_batch calls.
     #[arg(long, conflicts_with = "ms")]
     batches: Option<usize>,
+    /// Time the reference search_batch implementation instead of continuous search.
+    #[arg(long)]
+    reference_batches: bool,
     #[arg(long, default_value_t = 1)]
     threads: usize,
+    /// Selections per reference batch; requires --batches or --reference-batches.
+    #[arg(long, requires = "reference_mode")]
+    batch_size: Option<usize>,
     #[arg(long, default_value_t = 41001)]
     seed: u64,
     #[arg(long, default_value_t = 32_000_000)]
@@ -35,11 +43,13 @@ fn cpu_time() -> Option<u64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let defaults = Config::for_threads(args.threads);
     let config = Config {
         threads: args.threads,
+        batch_size: args.batch_size.unwrap_or(defaults.batch_size),
         seed: args.seed,
         max_nodes: args.max_nodes,
-        ..Config::default()
+        ..defaults
     };
     let (board, queue) = if let Some(path) = &args.position {
         parse_position(&serde_json::from_slice::<Value>(&std::fs::read(path)?)?)?
@@ -60,9 +70,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..batches {
             search.search_batch();
         }
+    } else if args.reference_batches {
+        let deadline = Instant::now() + Duration::from_millis(args.ms);
+        while Instant::now() < deadline {
+            if search.search_batch() == 0 {
+                let stats = search.stats();
+                if stats.memory_limited || stats.dead {
+                    break;
+                }
+            }
+        }
     } else {
         search.think(Duration::from_millis(args.ms));
     }
+    search.pause();
     let elapsed = start.elapsed().as_secs_f64();
     let process_cpu_ns = cpu_time()
         .zip(cpu_start)
@@ -78,10 +99,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "fast_low_stack": cfg!(feature = "fast-low-stack"),
             "prune_low_stack": cfg!(feature = "prune-low-stack"),
             "fast_registration": cfg!(feature = "fast-registration"),
+            "search_mode": if args.batches.is_some() || args.reference_batches {
+                "reference_batches"
+            } else {
+                "continuous"
+            },
             "config":config,"elapsed_seconds":elapsed,"process_cpu_ns":process_cpu_ns,
             "stats":search.stats(),"best_move":search.best_move(),"plan":search.current_plan(),
             "profile":profile
         })
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_size_requires_a_reference_search_mode() {
+        assert!(Args::try_parse_from(["profile_probe", "--batch-size", "16"]).is_err());
+        assert!(
+            Args::try_parse_from(["profile_probe", "--batches", "2", "--batch-size", "16",])
+                .is_ok()
+        );
+        assert!(
+            Args::try_parse_from([
+                "profile_probe",
+                "--reference-batches",
+                "--ms",
+                "10",
+                "--batch-size",
+                "16",
+            ])
+            .is_ok()
+        );
+    }
 }

@@ -1,5 +1,5 @@
 //! TBP adapter. The worker starts pondering on `start`, including the countdown.
-//! `suggest` only reads a published snapshot; `play` confirms and advances a move.
+//! `suggest` asks the worker for its current result; `play` confirms and advances a move.
 use crate::board::{Board, HEIGHT, Piece, PieceKind, TSpin};
 use crate::eval::Weights;
 use crate::movegen::{Path, find_path};
@@ -168,6 +168,7 @@ enum Action {
     Reset(Board, u64),
     Play(Piece, u64),
     Reveal(PieceKind),
+    Publish,
     Stop,
     Quit,
 }
@@ -243,7 +244,7 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
                     // Materialize enough of the plan to represent an empty hold
                     // as a physical TBP move before publishing the initial state.
                     for _ in 0..3 {
-                        search.search_batch();
+                        search.search_step();
                         if snapshot(&search, position_id, &mut cache)["moves"]
                             .as_array()
                             .is_some_and(|a| !a.is_empty())
@@ -268,11 +269,14 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
                     Ok(())
                 }
                 Action::Reveal(piece) => search.add_next_piece(piece),
+                Action::Publish => Ok(()),
                 Action::Stop => {
                     running = false;
+                    search.pause();
                     Ok(())
                 }
                 Action::Quit => {
+                    search.pause();
                     let _ = request.reply.send(Ok(()));
                     break;
                 }
@@ -280,8 +284,7 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
             *published.write().unwrap() = snapshot(&search, position_id, &mut cache);
             let _ = request.reply.send(result);
         } else {
-            let expanded = search.search_batch();
-            *published.write().unwrap() = snapshot(&search, position_id, &mut cache);
+            let expanded = search.search_step();
             if expanded == 0 {
                 // At the configured depth/memory bound, block briefly on input
                 // instead of burning a core repeatedly publishing the same tree.
@@ -295,6 +298,7 @@ fn worker(rx: mpsc::Receiver<Request>, published: Arc<RwLock<Value>>, mut search
             }
         }
     }
+    search.pause();
 }
 
 pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
@@ -351,10 +355,7 @@ pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
                         Ok(Some(Action::Play(piece, id)))
                     }
                     "new_piece" => Ok(Some(Action::Reveal(kind(&message["piece"])?))),
-                    "suggest" => {
-                        send(&mut output, &published.read().unwrap())?;
-                        Ok(None)
-                    }
+                    "suggest" => Ok(Some(Action::Publish)),
                     "stop" => Ok(Some(Action::Stop)),
                     "quit" => Ok(Some(Action::Quit)),
                     _ => Err("unknown message type".into()),
@@ -369,11 +370,16 @@ pub fn run_tbp(config: Config, weights: Weights) -> Result<(), String> {
             };
             if let Some(action) = action {
                 let quit = matches!(action, Action::Quit);
+                let publish = matches!(action, Action::Publish);
                 let (reply, done) = mpsc::sync_channel(1);
                 tx.send(Request { action, reply })
                     .map_err(|e| e.to_string())?;
                 match done.recv().map_err(|e| e.to_string())? {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if publish {
+                            send(&mut output, &published.read().unwrap())?;
+                        }
+                    }
                     Err(reason) => send(&mut output, &json!({"type":"error","reason":reason}))?,
                 }
                 if quit {

@@ -20,12 +20,9 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct Options {
-    /// Number of parallel move-generation workers.
-    #[arg(long, default_value_t = 1)]
+    /// Number of native search workers; defaults to the available CPU parallelism.
+    #[arg(long, default_value_t = available_workers())]
     threads: usize,
-    /// Randomized leaf selections per batch (Hikari's ParallelCount).
-    #[arg(long, default_value_t = 128)]
-    batch_size: usize,
     #[arg(long, default_value_t = 32)]
     max_depth: usize,
     /// Stop adding nodes at this bound; keep the existing DAG.
@@ -38,17 +35,22 @@ struct Options {
     #[arg(long)]
     no_speculation: bool,
 }
+
+fn available_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
 impl Options {
     fn config(&self) -> Config {
+        let defaults = Config::for_threads(self.threads);
         Config {
             threads: self.threads,
-            batch_size: self.batch_size,
             max_depth: self.max_depth,
             max_nodes: self.max_nodes,
             seed: self.seed,
             use_hold: !self.no_hold,
             use_speculation: !self.no_speculation,
-            ..Config::default()
+            ..defaults
         }
     }
 }
@@ -66,6 +68,9 @@ enum Command {
         options: Options,
         #[arg(long, default_value_t = 3000)]
         ms: u64,
+        /// Benchmark the reference batch implementation with this selection count.
+        #[arg(long)]
+        reference_batch_size: Option<usize>,
         /// JSON containing board and known queue; without it use an empty board.
         #[arg(long)]
         position: Option<PathBuf>,
@@ -122,8 +127,12 @@ fn run() -> Result<(), String> {
             options,
             ms,
             position,
+            reference_batch_size,
         } => {
-            let config = options.config();
+            let mut config = options.config();
+            if let Some(batch_size) = reference_batch_size {
+                config.batch_size = batch_size;
+            }
             let (board, queue) = if let Some(path) = position {
                 let value: Value = serde_json::from_str(
                     &std::fs::read_to_string(path).map_err(|e| e.to_string())?,
@@ -142,11 +151,25 @@ fn run() -> Result<(), String> {
             let mut search = Search::new(config.clone(), Weights::default())?;
             search.start(board, queue);
             let start = Instant::now();
-            search.think(Duration::from_millis(ms));
+            if reference_batch_size.is_some() {
+                let deadline = start + Duration::from_millis(ms);
+                while Instant::now() < deadline {
+                    if search.search_batch() == 0 {
+                        let stats = search.stats();
+                        if stats.memory_limited || stats.dead {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                search.think(Duration::from_millis(ms));
+            }
+            search.pause();
             let elapsed = start.elapsed().as_secs_f64();
             println!(
                 "{}",
                 json!({"reference_commit":hikari_rei::REFERENCE_COMMIT,"config":config,
+                "search_mode":if reference_batch_size.is_some() { "reference_batches" } else { "continuous" },
                 "elapsed_seconds":elapsed,"stats":search.stats(),"best_move":search.best_move(),"plan":search.current_plan()})
             );
             Ok(())
@@ -251,5 +274,80 @@ impl SevenBag {
             }
         }
         self.bag.pop().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bench_config(args: &[&str]) -> Config {
+        let Command::Bench { options, .. } = Cli::try_parse_from(args).unwrap().command else {
+            panic!("expected bench command");
+        };
+        options.config()
+    }
+
+    #[test]
+    fn search_workers_use_the_requested_configuration() {
+        let config = bench_config(&["hikari_rei", "bench", "--threads", "8"]);
+        assert_eq!(config.threads, 8);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn explicit_search_options_override_worker_configuration() {
+        let config = bench_config(&[
+            "hikari_rei",
+            "bench",
+            "--threads",
+            "8",
+            "--max-depth",
+            "17",
+            "--max-nodes",
+            "9000",
+            "--seed",
+            "19",
+            "--no-hold",
+            "--no-speculation",
+        ]);
+        assert_eq!(config.threads, 8);
+        assert_eq!(config.max_depth, 17);
+        assert_eq!(config.max_nodes, 9000);
+        assert_eq!(config.seed, 19);
+        assert!(!config.use_hold);
+        assert!(!config.use_speculation);
+    }
+
+    #[test]
+    fn zero_workers_remain_invalid() {
+        let config = bench_config(&["hikari_rei", "bench", "--threads", "0"]);
+        assert_eq!(config.threads, 0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn continuous_search_cli_has_no_batch_size_option() {
+        assert!(Cli::try_parse_from(["hikari_rei", "bench", "--batch-size", "128"]).is_err());
+    }
+
+    #[test]
+    fn reference_batch_option_is_available_only_for_bench() {
+        let Command::Bench {
+            reference_batch_size,
+            ..
+        } = Cli::try_parse_from(["hikari_rei", "bench", "--reference-batch-size", "128"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected bench command");
+        };
+        assert_eq!(reference_batch_size, Some(128));
+        for command in ["tbp", "selfplay", "ultra"] {
+            assert!(
+                Cli::try_parse_from(["hikari_rei", command, "--reference-batch-size", "128",])
+                    .is_err()
+            );
+        }
     }
 }

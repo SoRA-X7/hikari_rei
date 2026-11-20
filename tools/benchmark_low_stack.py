@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import statistics
 import subprocess
+from probe_command import reference_bench_command
 import sys
 import time
 
@@ -226,10 +227,12 @@ def main():
     parser.add_argument("--micro-trials", type=int, default=5)
     parser.add_argument("--micro-ms", type=int, default=150)
     parser.add_argument("--max-nodes", type=int, default=32_000_000)
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Use the same explicit selection count in both builds")
     parser.add_argument("--positions", nargs="+", choices=("empty", "garbage-low", "garbage-middle", "garbage-high"))
     parser.add_argument("--skip-search", action="store_true")
     args = parser.parse_args()
-    if min(args.trials, args.micro_trials, args.micro_ms, args.search_ms, args.max_nodes) <= 0:
+    if min(args.trials, args.micro_trials, args.micro_ms, args.search_ms, args.max_nodes, args.batch_size) <= 0:
         parser.error("durations, trials and node cap must be positive")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -297,9 +300,9 @@ def main():
                     order = ("baseline", "candidate") if (trial + threads + list(positions).index(position)) % 2 == 0 else ("candidate", "baseline")
                     for variant in order:
                         path = output / "search" / f"{position}-{threads}t-{trial:02}-{variant}.json"
-                        command = [binaries[variant], "bench", "--ms", args.search_ms,
+                        command = reference_bench_command(binaries[variant], ["--ms", args.search_ms,
                                    "--threads", threads, "--max-nodes", args.max_nodes,
-                                   "--seed", 41_001 + trial, "--position", output / "positions" / f"{position}.json"]
+                                   "--seed", 41_001 + trial, "--position", output / "positions" / f"{position}.json"], args.batch_size)
                         run(command, commands, path)
                         searches.append({"position": position, "threads": threads,
                                          "trial": trial, "variant": variant, "result": load(path)})

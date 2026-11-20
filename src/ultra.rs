@@ -70,14 +70,14 @@ impl Thinker {
             .spawn(move || {
                 let mut position = 0;
                 let mut cache: Option<(Board, Piece, bool, Path)> = None;
-                loop {
+                'search: loop {
                     let mut command = rx.try_recv().ok();
                     while let Some(request) = command {
                         match request {
-                            Command::Quit => return,
+                            Command::Quit => break 'search,
                             Command::Reveal(kind) => {
                                 if search.add_next_piece(kind).is_err() {
-                                    return;
+                                    break 'search;
                                 }
                             }
                             Command::EmptyHold { expected, queue, reply } => {
@@ -90,7 +90,7 @@ impl Thinker {
                                 })();
                                 let failed = result.is_err();
                                 let _ = reply.send(result);
-                                if failed { return; }
+                                if failed { break 'search; }
                             }
                             Command::Commit {
                                 piece,
@@ -117,13 +117,13 @@ impl Thinker {
                                 };
                                 let _ = reply.send(result);
                                 if failed {
-                                    return;
+                                    break 'search;
                                 }
                             }
                         }
                         command = rx.try_recv().ok();
                     }
-                    let expanded = search.search_batch();
+                    let expanded = search.search_step();
                     let chosen = search.best_move();
                     let empty_hold = chosen.is_some_and(|chosen| chosen.piece.is_none());
                     let piece = chosen.and_then(|chosen| {
@@ -149,11 +149,12 @@ impl Thinker {
                         stats: search.stats(),
                     };
                     if expanded == 0 {
-                        // Keep the command latency below one frame when a
-                        // memory/depth bound leaves nothing further to expand.
+                        // Avoid polling continuously when a memory/depth bound
+                        // leaves nothing further to expand.
                         thread::sleep(Duration::from_millis(1));
                     }
                 }
+                search.pause();
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {

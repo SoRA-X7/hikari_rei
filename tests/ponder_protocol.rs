@@ -11,8 +11,14 @@ struct Engine {
 }
 impl Engine {
     fn new() -> Self {
+        Self::with_workers_and_limit(2, 200_000)
+    }
+    fn with_workers_and_limit(threads: usize, max_nodes: usize) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_hikari_rei"))
-            .args(["tbp", "--batch-size", "8", "--max-nodes", "200000"])
+            .args(["tbp", "--threads"])
+            .arg(threads.to_string())
+            .arg("--max-nodes")
+            .arg(max_nodes.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -35,7 +41,10 @@ impl Engine {
             input,
             output,
         };
-        assert_eq!(engine.read()["type"], "info");
+        let info = engine.read();
+        assert_eq!(info["type"], "info");
+        assert_eq!(info["config"]["threads"].as_u64(), Some(threads as u64));
+        assert_eq!(info["config"]["max_nodes"].as_u64(), Some(max_nodes as u64));
         engine
     }
     fn send(&mut self, value: Value) {
@@ -134,4 +143,32 @@ fn same_kind_at_bag_boundary_is_a_representable_normal_placement() {
     assert_eq!(confirmed["queue"].as_array().unwrap().len(), 7);
     engine.send(json!({"type":"quit"}));
     assert!(engine.child.wait().unwrap().success());
+}
+
+#[test]
+fn active_high_worker_search_stops_and_restarts_without_late_publication() {
+    for threads in [12, 24] {
+        let mut engine = Engine::with_workers_and_limit(threads, 4_000_000);
+        for position in [301, 302] {
+            engine.send(json!({"type":"start","position_id":position,"board":[],
+                "queue":["T","O","I","J","L","Z","S","I","T","O","J","L"]}));
+            let active = engine.suggest();
+            assert_eq!(active["position_id"], position);
+            assert!(!active["moves"].as_array().unwrap().is_empty());
+            assert_eq!(active["move_info"]["search"]["memory_limited"], false);
+            assert_eq!(active["move_info"]["search"]["dead"], false);
+            // Stop immediately, without waiting long enough to hit a node cap.
+            // The second start also reuses layer IDs after the first drain.
+            engine.send(json!({"type":"stop"}));
+            let stopped = engine.suggest();
+            assert_eq!(stopped["position_id"], position);
+            assert_eq!(stopped["move_info"]["search"]["memory_limited"], false);
+            assert_eq!(stopped["move_info"]["search"]["dead"], false);
+            assert!(stopped["move_info"]["search"]["nodes"].as_u64().unwrap() < 4_000_000);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(stopped, engine.suggest());
+        }
+        engine.send(json!({"type":"quit"}));
+        assert!(engine.child.wait().unwrap().success());
+    }
 }
